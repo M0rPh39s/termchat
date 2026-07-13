@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# termchat runtime data
+*.db
+*.db-wal
+*.db-shm
+termchat.db*

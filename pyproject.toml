@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termchat"
+version = "1.0.0"
+description = "A TeamSpeak-style terminal chat application (server + TUI client)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = ["rich>=13.0"]
+
+[project.scripts]
+termchat-server = "termchat.server:main"
+termchat-client = "termchat.client:main"
+
+[tool.setuptools]
+packages = ["termchat"]
