@@ -1,0 +1,4 @@
+# termchat runtime dependencies.
+# Everything else (socket, sqlite3, hashlib, threading, curses/termios) is
+# part of the Python standard library.
+rich>=13.0
