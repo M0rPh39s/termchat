@@ -32,6 +32,9 @@ packaged into a standalone Windows executable.
   a channel; everything is persisted in SQLite.
 - **Beautiful TUI** — left sidebar with channels + online users, main chat
   area, input line, per-user colours, keyboard navigation.
+- **Desktop GUI app** — a dark-themed point-and-click client (Tkinter) that
+  can also **host the server itself**, and builds into a single standalone
+  `TermChat.exe` for Windows — no Python needed on the target machine.
 - **Graceful disconnects** — leaving or dropping a connection updates
   everyone else's user list automatically.
 - **Single account, single session** — the same account can't be logged in
@@ -40,10 +43,10 @@ packaged into a standalone Windows executable.
 ## Architecture
 
 ```
-        TCP (length-prefixed JSON frames)
- client  <----------------------------------->  server  <-->  SQLite DB
- (rich TUI)                                   (threaded)      (users, channels,
-                                                               messages,
+          TCP (length-prefixed JSON frames)
+ clients  <---------------------------------->  server  <-->  SQLite DB
+ (rich TUI /                                  (threaded)      (users, channels,
+  Tkinter GUI)                                                 messages,
                                                                memberships)
 ```
 
@@ -56,8 +59,9 @@ packaged into a standalone Windows executable.
 | GUI client | `termchat/gui.py` | Tkinter desktop app; can also embed the server |
 
 The server is **threaded** — one thread per connected client — with all shared
-state guarded by a lock. The client runs the renderer + keyboard loop on the
-main thread and a background thread for receiving server pushes.
+state guarded by a lock. Both clients run their UI on the main thread and a
+background thread for receiving server pushes (the GUI hands them to Tk
+through a queue).
 
 ### Database schema
 
@@ -82,7 +86,7 @@ memberships (user_id, channel_id, joined_at)   -- who has joined which channel
 ## Installation
 
 ```bash
-git clone <this-repo> termchat
+git clone https://github.com/M0rPh39s/termchat.git
 cd termchat
 
 # recommended: a virtual environment
@@ -93,8 +97,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Optionally install it as a package to get the `termchat-server` /
-`termchat-client` console commands:
+Optionally install it as a package to get the `termchat-server`,
+`termchat-client` and `termchat-gui` commands:
 
 ```bash
 pip install -e .
