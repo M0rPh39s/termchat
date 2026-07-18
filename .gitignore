@@ -8,6 +8,9 @@ dist/
 .venv/
 venv/
 
+# PyInstaller
+*.spec
+
 # termchat runtime data
 *.db
 *.db-wal

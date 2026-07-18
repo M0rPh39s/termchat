@@ -15,5 +15,8 @@ dependencies = ["rich>=13.0"]
 termchat-server = "termchat.server:main"
 termchat-client = "termchat.client:main"
 
+[project.gui-scripts]
+termchat-gui = "termchat.gui:main"
+
 [tool.setuptools]
 packages = ["termchat"]
