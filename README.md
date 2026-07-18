@@ -1,8 +1,9 @@
 # termchat
 
-A **TeamSpeak-style terminal chat application** — a multi-user, channel-based
-chat system with a TCP server, a SQLite database, and a beautiful full-screen
-terminal UI (TUI) client for Linux.
+A **TeamSpeak-style chat application** — a multi-user, channel-based chat
+system with a TCP server, a SQLite database, a full-screen terminal UI (TUI)
+client for Linux, and a **cross-platform desktop GUI client** that can be
+packaged into a standalone Windows executable.
 
 ```
 +--------------+--------------------------------------+
@@ -51,7 +52,8 @@ terminal UI (TUI) client for Linux.
 | Wire protocol | `termchat/protocol.py` | 4-byte length-prefixed JSON framing + message schema |
 | Database | `termchat/database.py` | SQLite schema, password hashing, all queries |
 | Server | `termchat/server.py` | TCP server, sessions, auth, routing, broadcast |
-| Client | `termchat/client.py` | rich TUI, login screen, keyboard handling |
+| TUI client | `termchat/client.py` | rich TUI, login screen, keyboard handling |
+| GUI client | `termchat/gui.py` | Tkinter desktop app; can also embed the server |
 
 The server is **threaded** — one thread per connected client — with all shared
 state guarded by a lock. The client runs the renderer + keyboard loop on the
@@ -70,10 +72,12 @@ memberships (user_id, channel_id, joined_at)   -- who has joined which channel
 
 - **Python 3.8+**
 - **[`rich`](https://github.com/Textualize/rich)** — the only third-party
-  dependency. Everything else (`socket`, `sqlite3`, `hashlib`, `threading`,
-  `termios`) is in the standard library.
-- A Linux/macOS terminal for the client (it uses raw-mode `termios`, so it does
-  not run on native Windows — use WSL there).
+  dependency, and only needed by the **TUI** client. Everything else
+  (`socket`, `sqlite3`, `hashlib`, `threading`, `termios`, `tkinter`) is in
+  the standard library.
+- The **TUI client** needs a Linux/macOS terminal (raw-mode `termios`, so it
+  does not run on native Windows — use WSL there). The **GUI client** and the
+  **server** run anywhere, including native Windows.
 
 ## Installation
 
@@ -136,7 +140,42 @@ termchat-client --host chat.example.com --port 9009
 You'll get a login screen — choose **register** the first time to create an
 account, then log straight in.
 
-## Using the client
+## Desktop GUI app
+
+The GUI client (`termchat/gui.py`) is a point-and-click alternative to the
+TUI. It uses only the Python standard library (Tkinter), so it runs on
+Windows, macOS and Linux with no extra dependencies:
+
+```bash
+python run_gui.py
+# or, if installed as a package:
+termchat-gui
+```
+
+- **Log in / Register** — enter the server host and port, pick a username and
+  password, and click *Register* the first time (it logs you straight in).
+- **Host a local server** — tick the checkbox on the login screen and the app
+  starts an embedded server on the chosen port before connecting. Friends on
+  your network can then join with the LAN address shown in the status line.
+  The embedded server stores its database in `%LOCALAPPDATA%\TermChat\`
+  (or `~/TermChat` if that variable is unset).
+- **Channels** — click a channel in the sidebar to join it; *+ New channel*
+  creates (and auto-joins) one. The online list and messages update live.
+- **Send** — type in the input bar and press Enter or click *Send*.
+
+### Building a standalone Windows executable
+
+```powershell
+pip install pyinstaller
+python -m PyInstaller --noconfirm --onefile --windowed --name TermChat `
+    --icon assets\termchat.ico --add-data "assets\termchat.ico;assets" run_gui.py
+```
+
+The result is a single self-contained `dist\TermChat.exe` (~12 MB, no Python
+installation required on the target machine). Because it can also host the
+server, one exe is enough to run a whole chat for your LAN.
+
+## Using the terminal client
 
 Once logged in you're dropped into the first channel.
 
@@ -241,10 +280,14 @@ termchat/
 │   ├── protocol.py       # framing + message schema (shared)
 │   ├── database.py       # SQLite layer + password hashing
 │   ├── server.py         # TCP server
-│   └── client.py         # rich TUI client
+│   ├── client.py         # rich TUI client
+│   └── gui.py            # Tkinter desktop GUI client
+├── assets/
+│   └── termchat.ico      # app icon (window + exe)
 ├── init_db.py            # database init / inspection tool
 ├── run_server.py         # server launcher
-├── run_client.py         # client launcher
+├── run_client.py         # TUI client launcher
+├── run_gui.py            # GUI launcher / PyInstaller entry point
 ├── requirements.txt
 ├── pyproject.toml        # packaging + console scripts
 └── README.md
