@@ -11,9 +11,14 @@ requires-python = ">=3.8"
 license = { text = "MIT" }
 dependencies = ["rich>=13.0"]
 
+[project.optional-dependencies]
+# Only needed for the optional `--ngrok` public tunnel of the web UI.
+ngrok = ["pyngrok>=7.0"]
+
 [project.scripts]
 termchat-server = "termchat.server:main"
 termchat-client = "termchat.client:main"
+termchat-web = "termchat.web:main"
 
 [project.gui-scripts]
 termchat-gui = "termchat.gui:main"

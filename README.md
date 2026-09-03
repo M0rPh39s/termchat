@@ -35,6 +35,8 @@ packaged into a standalone Windows executable.
 - **Desktop GUI app** — a dark-themed point-and-click client (Tkinter) that
   can also **host the server itself**, and builds into a single standalone
   `TermChat.exe` for Windows — no Python needed on the target machine.
+- **Web UI** — a browser client served straight from Python (no build step,
+  stdlib only), with a one-flag **ngrok** tunnel to share a public link.
 - **Graceful disconnects** — leaving or dropping a connection updates
   everyone else's user list automatically.
 - **Single account, single session** — the same account can't be logged in
@@ -57,6 +59,7 @@ packaged into a standalone Windows executable.
 | Server | `termchat/server.py` | TCP server, sessions, auth, routing, broadcast |
 | TUI client | `termchat/client.py` | rich TUI, login screen, keyboard handling |
 | GUI client | `termchat/gui.py` | Tkinter desktop app; can also embed the server |
+| Web UI | `termchat/web.py` | HTTP + SSE bridge to the server; browser front-end |
 
 The server is **threaded** — one thread per connected client — with all shared
 state guarded by a lock. Both clients run their UI on the main thread and a
@@ -179,6 +182,51 @@ The result is a single self-contained `dist\TermChat.exe` (~12 MB, no Python
 installation required on the target machine). Because it can also host the
 server, one exe is enough to run a whole chat for your LAN.
 
+## Web UI
+
+The web client (`termchat/web.py`) serves a browser front-end and bridges it
+to the chat server over HTTP + **Server-Sent Events** — so every browser tab
+gets a real connection to the server and speaks the exact same wire protocol
+as the TUI and GUI clients. It uses only the Python standard library.
+
+```bash
+python run_web.py --port 8080
+# or, if installed as a package:
+termchat-web --port 8080
+```
+
+By default it also **starts a chat server for you** (an embedded
+`termchat-server`), so a single command is enough to get a working chat.
+Then open <http://localhost:8080> and register/log in.
+
+- `--port` the web port (default `8080`).
+- `--host` interface for the web server (default `0.0.0.0`).
+- `--db` SQLite path used by the embedded server (default `termchat.db`).
+- `--no-embed` don't start a server — bridge to an existing one instead
+  (combine with `--server-host` / `--server-port`).
+- `--ngrok` open a public tunnel and print the shareable URL (see below).
+- `-v` for debug logging.
+
+### Sharing a public link with ngrok
+
+To let people outside your network join without any port-forwarding, add the
+`--ngrok` flag. It opens an [ngrok](https://ngrok.com) tunnel to the web port
+and prints a public `https://…` URL you can share:
+
+```bash
+pip install pyngrok          # or: pip install -e ".[ngrok]"
+# authenticate ngrok once (free account): ngrok config add-authtoken <TOKEN>
+python run_web.py --ngrok
+#   termchat is live at: https://<random>.ngrok-free.app
+```
+
+Anyone with that link gets the full chat in their browser. The tunnel closes
+when you stop the process.
+
+> **Security note:** the same plaintext-over-the-wire caveat applies. ngrok
+> gives you HTTPS to the tunnel edge, but anyone with the link can reach your
+> chat, so treat the URL as a shared secret and stop the process when done.
+
 ## Using the terminal client
 
 Once logged in you're dropped into the first channel.
@@ -285,13 +333,15 @@ termchat/
 │   ├── database.py       # SQLite layer + password hashing
 │   ├── server.py         # TCP server
 │   ├── client.py         # rich TUI client
-│   └── gui.py            # Tkinter desktop GUI client
+│   ├── gui.py            # Tkinter desktop GUI client
+│   └── web.py            # web UI: HTTP + SSE bridge + browser front-end
 ├── assets/
 │   └── termchat.ico      # app icon (window + exe)
 ├── init_db.py            # database init / inspection tool
 ├── run_server.py         # server launcher
 ├── run_client.py         # TUI client launcher
 ├── run_gui.py            # GUI launcher / PyInstaller entry point
+├── run_web.py            # web UI launcher (HTTP/SSE, optional ngrok)
 ├── requirements.txt
 ├── pyproject.toml        # packaging + console scripts
 └── README.md
