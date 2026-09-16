@@ -137,6 +137,21 @@ class Server:
         else:
             log.info("connection closed %s", state.addr)
 
+    # -- transport-agnostic hooks ---------------------------------------------
+    # Used by alternate transports (e.g. the WebSocket bridge in web.py) that
+    # frame messages differently but want the same session/routing logic as
+    # raw TCP clients.
+
+    def register_client(self, state: "ClientState"):
+        with self._lock:
+            self._clients[state.conn] = state
+
+    def dispatch(self, state: "ClientState", msg: dict):
+        self._dispatch(state, msg)
+
+    def disconnect_client(self, state: "ClientState"):
+        self._disconnect(state)
+
     # -- dispatch ------------------------------------------------------------
 
     def _dispatch(self, state: ClientState, msg: dict):
@@ -347,6 +362,11 @@ def main(argv=None):
                         help=f"port to listen on (default: {DEFAULT_PORT})")
     parser.add_argument("--db", default="termchat.db",
                         help="path to the SQLite database (default: termchat.db)")
+    parser.add_argument("--web-port", type=int, default=None,
+                        help="also serve a browser client on this HTTP port "
+                             "(shares the same chat with TCP clients)")
+    parser.add_argument("--web-host", default=None,
+                        help="interface for the browser client (default: same as --host)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="enable debug logging")
     args = parser.parse_args(argv)
@@ -358,6 +378,11 @@ def main(argv=None):
     )
 
     server = Server(args.host, args.port, args.db)
+
+    if args.web_port is not None:
+        from .web import run_web_in_thread
+        run_web_in_thread(server, args.web_host or args.host, args.web_port)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
