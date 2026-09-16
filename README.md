@@ -35,6 +35,10 @@ packaged into a standalone Windows executable.
 - **Desktop GUI app** — a dark-themed point-and-click client (Tkinter) that
   can also **host the server itself**, and builds into a single standalone
   `TermChat.exe` for Windows — no Python needed on the target machine.
+- **Browser client** — a mobile-friendly web UI, no install needed. The
+  server can optionally serve it over plain HTTP/WebSocket so anyone on the
+  network can chat from a browser at `http://<server-ip>:<port>`, sharing
+  the same channels/messages as the TUI and GUI clients in real time.
 - **Graceful disconnects** — leaving or dropping a connection updates
   everyone else's user list automatically.
 - **Single account, single session** — the same account can't be logged in
@@ -57,6 +61,8 @@ packaged into a standalone Windows executable.
 | Server | `termchat/server.py` | TCP server, sessions, auth, routing, broadcast |
 | TUI client | `termchat/client.py` | rich TUI, login screen, keyboard handling |
 | GUI client | `termchat/gui.py` | Tkinter desktop app; can also embed the server |
+| WebSocket framing | `termchat/ws.py` | minimal stdlib RFC 6455 handshake + frames |
+| Browser client | `termchat/web.py` | HTTP server + WS bridge into the same `Server`; serves the single-page chat UI |
 
 The server is **threaded** — one thread per connected client — with all shared
 state guarded by a lock. Both clients run their UI on the main thread and a
@@ -143,6 +149,30 @@ termchat-client --host chat.example.com --port 9009
 
 You'll get a login screen — choose **register** the first time to create an
 account, then log straight in.
+
+## Browser client
+
+Add `--web-port` when starting the server to also serve a mobile-friendly
+web chat UI, over plain HTTP with a WebSocket connection back to the same
+server (no separate process, no extra dependency — it's all in the stdlib):
+
+```bash
+python run_server.py --host 0.0.0.0 --port 9009 --web-port 8080 --db termchat.db
+```
+
+Then open `http://<this-pc's-ip>:8080` in any browser on the network (find
+your IP with `hostname -I` on Linux/macOS or `ipconfig` on Windows). Browser
+users register/log in and chat in the same channels as TUI and GUI clients,
+in real time — it's a fourth transport into the same `Server`, not a
+separate chat.
+
+- `--web-host` sets a different interface for the browser UI than `--host`
+  if needed; it defaults to the same one.
+- Like the TCP port, open `--web-port` in your firewall if you want other
+  machines to reach it (`sudo ufw allow 8080/tcp`).
+- Traffic is plain HTTP/WS, so the same security note as below applies —
+  put it behind a reverse proxy with TLS (e.g. nginx/Caddy) if it's
+  reachable from an untrusted network.
 
 ## Desktop GUI app
 

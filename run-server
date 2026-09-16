@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Runs everything: the termchat TCP server, the browser (web) client, and
+# an ngrok tunnel so it's reachable from the public internet.
+#
+# Usage: run-server [--no-ngrok]
+#
+# Env overrides: TERMCHAT_HOST, TERMCHAT_PORT, TERMCHAT_WEB_PORT, TERMCHAT_DB
+set -uo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VENV_PY="$PROJECT_DIR/.venv/bin/python"
+HOST="${TERMCHAT_HOST:-0.0.0.0}"
+PORT="${TERMCHAT_PORT:-9009}"
+WEB_PORT="${TERMCHAT_WEB_PORT:-8080}"
+DB="${TERMCHAT_DB:-$PROJECT_DIR/termchat.db}"
+NGROK_LOG="/tmp/termchat-ngrok.log"
+USE_NGROK=1
+[[ "${1:-}" == "--no-ngrok" ]] && USE_NGROK=0
+
+if [[ ! -x "$VENV_PY" ]]; then
+    echo "no venv found at $PROJECT_DIR/.venv - run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
+SERVER_PID=""
+NGROK_PID=""
+
+cleanup() {
+    echo
+    echo "shutting down..."
+    [[ -n "$NGROK_PID" ]] && kill "$NGROK_PID" 2>/dev/null
+    [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
+    wait 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+echo "starting termchat server (tcp:$PORT, web:$WEB_PORT, db:$DB)..."
+"$VENV_PY" "$PROJECT_DIR/run_server.py" \
+    --host "$HOST" --port "$PORT" --web-port "$WEB_PORT" --db "$DB" -v &
+SERVER_PID=$!
+
+for _ in $(seq 1 40); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$WEB_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "server failed to start" >&2; exit 1; }
+    sleep 0.25
+done
+
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+echo
+echo "  local:  http://127.0.0.1:$WEB_PORT"
+[[ -n "$LAN_IP" ]] && echo "  lan:    http://$LAN_IP:$WEB_PORT"
+
+if [[ "$USE_NGROK" -eq 1 ]]; then
+    if command -v ngrok >/dev/null 2>&1; then
+        echo "starting ngrok tunnel..."
+        : > "$NGROK_LOG"
+        ngrok http "$WEB_PORT" --log=stdout > "$NGROK_LOG" 2>&1 &
+        NGROK_PID=$!
+        URL=""
+        for _ in $(seq 1 40); do
+            URL="$(grep -o 'url=https://[a-zA-Z0-9.-]*' "$NGROK_LOG" | tail -1 | cut -d= -f2)"
+            [[ -n "$URL" ]] && break
+            kill -0 "$NGROK_PID" 2>/dev/null || break
+            sleep 0.25
+        done
+        if [[ -n "$URL" ]]; then
+            echo "  public: $URL"
+        else
+            echo "  ngrok didn't report a URL yet - check $NGROK_LOG"
+        fi
+    else
+        echo "  (ngrok not on PATH - skipping public tunnel; pass nothing to retry, or --no-ngrok to silence this)"
+    fi
+fi
+
+echo
+echo "tui/gui clients connect on port $PORT. press Ctrl+C to stop everything."
+wait "$SERVER_PID"
