@@ -1,73 +1,152 @@
 # termchat
 
-A **TeamSpeak-style chat application** — a multi-user, channel-based chat
-system with a TCP server, a SQLite database, a full-screen terminal UI (TUI)
-client for Linux, and a **cross-platform desktop GUI client** that can be
-packaged into a standalone Windows executable.
+A **TeamSpeak-style chat application with a web interface** — a multi-user,
+channel-based chat you run with one command and share over the internet
+through an **[ngrok](https://ngrok.com)** tunnel. Anyone you send the link to
+opens it in their browser, registers, and starts chatting in real time. No
+install, no app, no account anywhere but your own server.
+
+Under the hood it's a small threaded Python server backed by SQLite; the
+browser UI talks to it over WebSocket. Terminal (TUI) and desktop (GUI)
+clients also exist and share the exact same chat (see
+[Other clients](#other-clients)).
 
 ```
-+--------------+--------------------------------------+
-|  CHANNELS    |  #general                            |
-|  > # general |  [12:00:01] alice: hello everyone    |
-|    # random  |  [12:00:12] bob:   hi alice          |
-|    # help    |                                      |
-|              |                                      |
-|  ONLINE (2)  |                                      |
-|  * alice     |                                      |
-|  * bob       +--------------------------------------+
-|              |  > type a message and press Enter    |
-+--------------+--------------------------------------+
+            you                                   your friends
+             │                                         │
+   ./run-server                                   open the link
+             │                                         │
+   ┌─────────▼──────────┐   https tunnel    ┌──────────▼──────────┐
+   │ termchat server    │◀─────ngrok───────▶│ browser (phone / PC)│
+   │ + web UI (:8080)   │                   │  register • chat    │
+   │ + SQLite database  │                   └─────────────────────┘
+   └────────────────────┘
 ```
 
 ## Features
 
+- **Web interface** — a clean, dark, mobile-friendly chat UI served straight
+  from the server. Left sidebar with channels + who's online, main chat area,
+  message input. Works on phones (off-canvas sidebar) and desktops alike.
+- **Public link via ngrok** — the `run-server` script starts the server *and*
+  an ngrok tunnel, then prints a `https://…ngrok…` URL you can share with
+  anyone, anywhere — no port forwarding, no firewall changes, no fixed IP.
 - **User accounts** — register and log in with a password (hashed with
   PBKDF2-HMAC-SHA256 + per-user salt; plaintext passwords are never stored).
 - **Channels/rooms** — like TeamSpeak. Ships with `#general`, `#random`,
   `#help`; create your own on the fly.
-- **Real-time messaging** — messages broadcast instantly to everyone viewing
-  the same channel.
-- **Online presence** — see who is currently in each channel, live.
+- **Real-time messaging & presence** — messages broadcast instantly to
+  everyone in the channel; the online list updates live as people come and go.
 - **Message history** — the last 50 messages load automatically when you open
   a channel; everything is persisted in SQLite.
-- **Beautiful TUI** — left sidebar with channels + online users, main chat
-  area, input line, per-user colours, keyboard navigation.
-- **Desktop GUI app** — a dark-themed point-and-click client (Tkinter) that
-  can also **host the server itself**, and builds into a single standalone
-  `TermChat.exe` for Windows — no Python needed on the target machine.
-- **Browser client** — a mobile-friendly web UI, no install needed. The
-  server can optionally serve it over plain HTTP/WebSocket so anyone on the
-  network can chat from a browser at `http://<server-ip>:<port>`, sharing
-  the same channels/messages as the TUI and GUI clients in real time.
+- **One shared chat, many front-ends** — browser, terminal (TUI) and desktop
+  (GUI) clients all connect to the same server and see each other live.
 - **Graceful disconnects** — leaving or dropping a connection updates
   everyone else's user list automatically.
-- **Single account, single session** — the same account can't be logged in
-  from two places at once.
 
-## Architecture
+## Requirements
+
+- **Python 3.8+**
+- **[ngrok](https://ngrok.com/download)** — for the public link. Free account;
+  one-time `ngrok config add-authtoken …`. (Optional — pass `--no-ngrok` to run
+  LAN-only.)
+- **[`rich`](https://github.com/Textualize/rich)** — the only Python
+  dependency, and only needed by the *terminal* client. The server, the web UI
+  and its WebSocket layer are pure standard library (`socket`, `http.server`,
+  `sqlite3`, `hashlib`, `threading`).
+
+## Quick start
+
+```bash
+git clone https://github.com/M0rPh39s/termchat.git
+cd termchat
+
+# one-time setup
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# install ngrok and authenticate (one-time), then:
+./run-server
+```
+
+`run-server` boots the chat server, serves the web UI, opens an ngrok tunnel,
+and prints something like:
 
 ```
-          TCP (length-prefixed JSON frames)
- clients  <---------------------------------->  server  <-->  SQLite DB
- (rich TUI /                                  (threaded)      (users, channels,
-  Tkinter GUI)                                                 messages,
-                                                               memberships)
+starting termchat server (tcp:9009, web:8080, db:.../termchat.db)...
+
+  local:  http://127.0.0.1:8080
+  lan:    http://192.168.1.20:8080
+starting ngrok tunnel...
+  public: https://a1b2-c3d4.ngrok-free.app
+
+tui/gui clients connect on port 9009. press Ctrl+C to stop everything.
+```
+
+Open the **public** URL (or send it to a friend), click **Register** the first
+time to create an account, and you're chatting. `Ctrl+C` stops the server and
+the tunnel together.
+
+### Setting up ngrok
+
+1. Install it — see <https://ngrok.com/download> (e.g. `snap install ngrok`, a
+   Homebrew/Chocolatey package, or the direct download). It just needs to be on
+   your `PATH`.
+2. Create a free account and add your authtoken once:
+   ```bash
+   ngrok config add-authtoken <YOUR_TOKEN>
+   ```
+3. Run `./run-server`. If ngrok isn't on `PATH`, the script still serves the
+   local/LAN URLs and just skips the public tunnel.
+
+### `run-server` options & environment
+
+```bash
+./run-server            # server + web UI + ngrok public link
+./run-server --no-ngrok # local/LAN only, no public tunnel
+```
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `TERMCHAT_WEB_PORT` | `8080` | HTTP port for the web UI (what ngrok tunnels) |
+| `TERMCHAT_PORT` | `9009` | TCP port for the terminal/desktop clients |
+| `TERMCHAT_HOST` | `0.0.0.0` | interface to bind |
+| `TERMCHAT_DB` | `./termchat.db` | SQLite database path |
+
+```bash
+TERMCHAT_WEB_PORT=3000 ./run-server      # serve/tunnel on port 3000 instead
+```
+
+## How it works
+
+The web server (`termchat/web.py`) runs **in the same process** as the chat
+server and shares one `Server` instance, so browser users are just another
+kind of client:
+
+```
+                         ngrok (public https)
+                                 │
+  browser ──WebSocket──▶ web.py (HTTP + WS) ─┐
+  TUI     ──TCP JSON───▶ server.py ──────────┼──▶ Server ──▶ SQLite DB
+  GUI     ──TCP JSON───▶ server.py ──────────┘      (sessions, auth,
+                                                     channels, routing)
 ```
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| Wire protocol | `termchat/protocol.py` | 4-byte length-prefixed JSON framing + message schema |
-| Database | `termchat/database.py` | SQLite schema, password hashing, all queries |
-| Server | `termchat/server.py` | TCP server, sessions, auth, routing, broadcast |
-| TUI client | `termchat/client.py` | rich TUI, login screen, keyboard handling |
-| GUI client | `termchat/gui.py` | Tkinter desktop app; can also embed the server |
+| Browser client | `termchat/web.py` | HTTP server, single-page UI, WebSocket bridge into the shared `Server` |
 | WebSocket framing | `termchat/ws.py` | minimal stdlib RFC 6455 handshake + frames |
-| Browser client | `termchat/web.py` | HTTP server + WS bridge into the same `Server`; serves the single-page chat UI |
+| Server | `termchat/server.py` | sessions, auth, channels, message routing/broadcast (TCP + a transport-agnostic dispatch used by the web bridge) |
+| Database | `termchat/database.py` | SQLite schema, password hashing, all queries |
+| Wire protocol | `termchat/protocol.py` | 4-byte length-prefixed JSON framing for TCP clients |
+| TUI client | `termchat/client.py` | rich terminal client |
+| GUI client | `termchat/gui.py` | Tkinter desktop client (can also embed a server) |
 
 The server is **threaded** — one thread per connected client — with all shared
-state guarded by a lock. Both clients run their UI on the main thread and a
-background thread for receiving server pushes (the GUI hands them to Tk
-through a queue).
+state guarded by a single lock. Browser messages arrive as WebSocket text
+frames, are decoded to the same JSON message types the TCP clients use, and
+flow through the identical dispatch/broadcast logic — so there is only ever one
+chat, regardless of how people connect.
 
 ### Database schema
 
@@ -78,44 +157,8 @@ messages    (id, channel_id -> channels.id, user_id -> users.id, content, timest
 memberships (user_id, channel_id, joined_at)   -- who has joined which channel
 ```
 
-## Requirements
-
-- **Python 3.8+**
-- **[`rich`](https://github.com/Textualize/rich)** — the only third-party
-  dependency, and only needed by the **TUI** client. Everything else
-  (`socket`, `sqlite3`, `hashlib`, `threading`, `termios`, `tkinter`) is in
-  the standard library.
-- The **TUI client** needs a Linux/macOS terminal (raw-mode `termios`, so it
-  does not run on native Windows — use WSL there). The **GUI client** and the
-  **server** run anywhere, including native Windows.
-
-## Installation
-
-```bash
-git clone https://github.com/M0rPh39s/termchat.git
-cd termchat
-
-# recommended: a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# install the one dependency
-pip install -r requirements.txt
-```
-
-Optionally install it as a package to get the `termchat-server`,
-`termchat-client` and `termchat-gui` commands:
-
-```bash
-pip install -e .
-```
-
-## Running
-
-### 1. (Optional) initialise the database
-
-The server creates the database and default channels automatically on first
-start, so this step is optional. Use it to pre-seed data or add a user:
+The database and default channels are created automatically on first start.
+To pre-seed or inspect it:
 
 ```bash
 python init_db.py                    # create schema + default channels
@@ -123,187 +166,76 @@ python init_db.py --add-user alice   # also create a user (prompts for pw)
 python init_db.py --show             # print a summary of the database
 ```
 
-### 2. Start the server
+## Running the server manually
 
-```bash
-python run_server.py --host 0.0.0.0 --port 9009 --db termchat.db
-# or, if installed as a package:
-termchat-server --host 0.0.0.0 --port 9009
-```
-
-- `--host 0.0.0.0` listens on all interfaces (use this when hosting for other
-  machines). Default is also `0.0.0.0`.
-- `--port` defaults to `9009`.
-- `--db` path to the SQLite file (default `termchat.db`).
-- `-v` for debug logging.
-
-### 3. Connect with the client
-
-In another terminal (or from another machine):
-
-```bash
-python run_client.py --host 127.0.0.1 --port 9009
-# or:
-termchat-client --host chat.example.com --port 9009
-```
-
-You'll get a login screen — choose **register** the first time to create an
-account, then log straight in.
-
-## Browser client
-
-Add `--web-port` when starting the server to also serve a mobile-friendly
-web chat UI, over plain HTTP with a WebSocket connection back to the same
-server (no separate process, no extra dependency — it's all in the stdlib):
+`run-server` is just a convenience wrapper. You can start the server directly
+and add the web UI with `--web-port`:
 
 ```bash
 python run_server.py --host 0.0.0.0 --port 9009 --web-port 8080 --db termchat.db
 ```
 
-Then open `http://<this-pc's-ip>:8080` in any browser on the network (find
-your IP with `hostname -I` on Linux/macOS or `ipconfig` on Windows). Browser
-users register/log in and chat in the same channels as TUI and GUI clients,
-in real time — it's a fourth transport into the same `Server`, not a
-separate chat.
+Then expose the web port yourself however you like — your own ngrok invocation,
+a reverse proxy, or a LAN address:
 
-- `--web-host` sets a different interface for the browser UI than `--host`
-  if needed; it defaults to the same one.
-- Like the TCP port, open `--web-port` in your firewall if you want other
-  machines to reach it (`sudo ufw allow 8080/tcp`).
-- Traffic is plain HTTP/WS, so the same security note as below applies —
-  put it behind a reverse proxy with TLS (e.g. nginx/Caddy) if it's
-  reachable from an untrusted network.
+```bash
+ngrok http 8080            # public https URL for the web UI
+```
 
-## Desktop GUI app
+- `--web-port` — serve the browser UI on this HTTP port (omit it for a
+  TCP-only server with no web interface).
+- `--web-host` — bind the web UI to a different interface than `--host`
+  (defaults to the same one).
+- `--port` — TCP port for terminal/desktop clients (default `9009`).
+- `--db` — SQLite path (default `termchat.db`). `-v` for debug logging.
 
-The GUI client (`termchat/gui.py`) is a point-and-click alternative to the
-TUI. It uses only the Python standard library (Tkinter), so it runs on
-Windows, macOS and Linux with no extra dependencies:
+> **Security note:** between your server and ngrok's edge, traffic to the
+> browser is plain HTTP/WS, but ngrok terminates **HTTPS** at its edge, so the
+> public link your friends use is encrypted. Passwords are always hashed at
+> rest. If you expose the raw `--web-port` directly (no ngrok), put it behind a
+> TLS reverse proxy (nginx/Caddy) for untrusted networks.
+
+## Other clients
+
+The browser is the main way in, but the same server also speaks a simple
+length-prefixed JSON protocol over TCP, which the terminal and desktop clients
+use. They share the same accounts, channels and messages as browser users.
+
+### Terminal (TUI) client
+
+A full-screen `rich` client for Linux/macOS terminals (uses raw-mode
+`termios`, so on native Windows use WSL):
+
+```bash
+python run_client.py --host 127.0.0.1 --port 9009
+# or, installed as a package: termchat-client --host your.server --port 9009
+```
+
+| Key | Action | | Command | Action |
+|-----|--------|---|---------|--------|
+| `Enter` | send line / run `/command` | | `/create <name>` | create a channel |
+| `Ctrl-N` / `↓` | next channel | | `/join <name\|id>` | join a channel |
+| `Ctrl-P` / `↑` | previous channel | | `/channels` `/users` | refresh lists |
+| `Ctrl-C` / `Ctrl-Q` | quit | | `/help` `/quit` | help / exit |
+
+### Desktop (GUI) client
+
+A dark-themed Tkinter app (standard library only) that can also host an
+embedded server, and builds into a standalone `TermChat.exe` for Windows:
 
 ```bash
 python run_gui.py
-# or, if installed as a package:
-termchat-gui
+# or, installed as a package: termchat-gui
 ```
 
-- **Log in / Register** — enter the server host and port, pick a username and
-  password, and click *Register* the first time (it logs you straight in).
-- **Host a local server** — tick the checkbox on the login screen and the app
-  starts an embedded server on the chosen port before connecting. Friends on
-  your network can then join with the LAN address shown in the status line.
-  The embedded server stores its database in `%LOCALAPPDATA%\TermChat\`
-  (or `~/TermChat` if that variable is unset).
-- **Channels** — click a channel in the sidebar to join it; *+ New channel*
-  creates (and auto-joins) one. The online list and messages update live.
-- **Send** — type in the input bar and press Enter or click *Send*.
-
-### Building a standalone Windows executable
-
 ```powershell
+# build a single-file Windows executable
 pip install pyinstaller
 python -m PyInstaller --noconfirm --onefile --windowed --name TermChat `
     --icon assets\termchat.ico --add-data "assets\termchat.ico;assets" run_gui.py
 ```
 
-The result is a single self-contained `dist\TermChat.exe` (~12 MB, no Python
-installation required on the target machine). Because it can also host the
-server, one exe is enough to run a whole chat for your LAN.
-
-## Using the terminal client
-
-Once logged in you're dropped into the first channel.
-
-### Keyboard shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send the current line (or run a `/command`) |
-| `Ctrl-N` / `↓` | Switch to the next channel |
-| `Ctrl-P` / `↑` | Switch to the previous channel |
-| `Backspace` | Delete a character |
-| `Ctrl-C` / `Ctrl-Q` | Quit |
-
-### Slash commands
-
-| Command | Action |
-|---------|--------|
-| `/help` | Show a quick command reference |
-| `/create <name>` | Create a new channel |
-| `/join <name\|id>` | Join a channel by name or number |
-| `/channels` | Refresh the channel list |
-| `/users` | Refresh the online-user list |
-| `/quit` | Disconnect and exit |
-
-## Example session
-
-Terminal 1 — the server:
-
-```bash
-$ python run_server.py
-12:00:00 INFO    termchat server listening on 0.0.0.0:9009
-12:00:07 INFO    connection from ('127.0.0.1', 51234)
-12:00:12 INFO    alice logged in (('127.0.0.1', 51234))
-```
-
-Terminal 2 — Alice:
-
-```
-Choose [login/register/quit] (login): register
-username: alice
-password: ****
-account created — logging in...
-   ... TUI opens, Alice is in #general ...
-> hello everyone
-```
-
-Terminal 3 — Bob (after registering/logging in and pressing `Ctrl-N` to
-land in `#general`) sees Alice's message appear in real time, and Alice's
-sidebar shows `ONLINE (2)  * alice  * bob`. Bob types:
-
-```
-> /create dev
-> /join dev
-> anyone around?
-```
-
-Alice switches with `Ctrl-N` until she reaches `#dev` and sees the history.
-
-## Hosting on a Linux server
-
-1. Copy the project to the server and install the dependency
-   (`pip install -r requirements.txt`).
-2. Run the server bound to a public interface:
-   `python run_server.py --host 0.0.0.0 --port 9009 --db /var/lib/termchat/termchat.db`
-3. Open the port in your firewall (e.g. `sudo ufw allow 9009/tcp`).
-4. Keep it running with a process manager. Example `systemd` unit:
-
-```ini
-# /etc/systemd/system/termchat.service
-[Unit]
-Description=termchat server
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/termchat
-ExecStart=/opt/termchat/.venv/bin/python run_server.py --host 0.0.0.0 --port 9009 --db /var/lib/termchat/termchat.db
-Restart=on-failure
-User=termchat
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable --now termchat
-```
-
-Clients then connect with
-`python run_client.py --host your.server.ip --port 9009`.
-
-> **Security note:** traffic is sent as plaintext JSON over TCP. Passwords are
-> hashed at rest, but for use over an untrusted network you should tunnel the
-> connection (e.g. run the client over SSH with a port forward, or put the
-> server behind a VPN). TLS is a natural next step.
+Install the console/GUI commands with `pip install -e .`.
 
 ## Project layout
 
@@ -311,17 +243,20 @@ Clients then connect with
 termchat/
 ├── termchat/
 │   ├── __init__.py       # package metadata + defaults
-│   ├── protocol.py       # framing + message schema (shared)
+│   ├── protocol.py       # TCP framing + message schema
 │   ├── database.py       # SQLite layer + password hashing
-│   ├── server.py         # TCP server
-│   ├── client.py         # rich TUI client
-│   └── gui.py            # Tkinter desktop GUI client
+│   ├── server.py         # chat server (sessions, auth, routing)
+│   ├── web.py            # browser client: HTTP server + single-page UI + WS bridge
+│   ├── ws.py             # minimal RFC 6455 WebSocket framing
+│   ├── client.py         # rich terminal (TUI) client
+│   └── gui.py            # Tkinter desktop (GUI) client
 ├── assets/
 │   └── termchat.ico      # app icon (window + exe)
-├── init_db.py            # database init / inspection tool
-├── run_server.py         # server launcher
+├── run-server            # start server + web UI + ngrok tunnel (main entry point)
+├── run_server.py         # server launcher (python)
 ├── run_client.py         # TUI client launcher
 ├── run_gui.py            # GUI launcher / PyInstaller entry point
+├── init_db.py            # database init / inspection tool
 ├── requirements.txt
 ├── pyproject.toml        # packaging + console scripts
 └── README.md
