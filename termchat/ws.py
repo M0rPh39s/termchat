@@ -1,11 +1,6 @@
-"""Minimal RFC 6455 WebSocket support (server side, stdlib only).
-
-Just enough to carry termchat's existing JSON message protocol over a
-browser WebSocket connection: the opening handshake and text-frame
-framing.  No compression extensions, no fragmentation of outgoing
-frames (every termchat message is tiny JSON, so a single frame per
-message is plenty).
-"""
+# minimal RFC 6455 websocket (server side, stdlib only) - just the
+# handshake + text frames, no compression, no fragmentation. termchat
+# messages are tiny JSON so one frame each is plenty.
 
 import base64
 import hashlib

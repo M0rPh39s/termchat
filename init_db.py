@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""Initialise (or inspect) the termchat SQLite database.
-
-Creating the schema is normally automatic — the server calls it on start
-— but this script lets you set things up ahead of time, seed the default
-channels, and optionally create an initial user.
-
-Usage::
-
-    python init_db.py                      # create schema + default channels
-    python init_db.py --db chat.db         # custom path
-    python init_db.py --add-user alice     # also create a user (prompts pw)
-    python init_db.py --show               # print a summary of the database
-"""
+# init/inspect the termchat db. the server does this automatically on
+# start too, this is just for seeding a user ahead of time or poking around.
 
 import argparse
 import getpass

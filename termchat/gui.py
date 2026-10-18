@@ -1,29 +1,8 @@
-"""termchat desktop GUI client (Tkinter).
-
-A point-and-click counterpart to the terminal client, sharing the same
-wire protocol (:mod:`termchat.protocol`).  Runs on Windows/macOS/Linux —
-no third-party dependencies, so it packages cleanly into a standalone
-executable with PyInstaller.
-
-Layout::
-
-    +--------------+--------------------------------------+
-    |  CHANNELS    |  # general                           |
-    |  # general   |  [12:00] alice: hello everyone       |
-    |  # random    |  [12:00] bob:   hi alice             |
-    |  + new       |                                      |
-    |              |                                      |
-    |  ONLINE (2)  |                                      |
-    |  * alice     +--------------------------------------+
-    |  * bob       |  [ type a message...        ] [Send] |
-    +--------------+--------------------------------------+
-
-The receiver thread never touches Tk directly: it pushes decoded server
-messages onto a queue that the UI drains with ``after()`` polling.
-
-The login screen can also start an **embedded server** ("Host a local
-server"), so a single executable can act as both server and client.
-"""
+# termchat desktop GUI client (Tkinter) - point-and-click version of the
+# TUI, same wire protocol, no 3rd-party deps so it packages fine with
+# PyInstaller. Receiver thread never touches Tk directly, it just pushes
+# onto a queue that the UI drains via after(). Login screen can also spin
+# up an embedded server ("host a local server").
 
 import os
 import queue

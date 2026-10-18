@@ -1,42 +1,8 @@
-"""termchat terminal client.
-
-A full-screen TUI built on `rich`.  Layout::
-
-    +--------------+--------------------------------------+
-    |  CHANNELS    |  #general                            |
-    |  > # general |  [12:00:01] alice: hello everyone    |
-    |    # random  |  [12:00:12] bob:   hi alice          |
-    |    # help    |                                      |
-    |              |                                      |
-    |  ONLINE (2)  |                                      |
-    |  * alice     |                                      |
-    |  * bob       +--------------------------------------+
-    |              |  > type a message and press Enter    |
-    +--------------+--------------------------------------+
-
-The main thread renders and reads the keyboard in raw mode; a background
-thread reads messages from the server and updates shared state.  The two
-communicate through a lock-guarded :class:`ClientModel`.
-
-Keyboard shortcuts
-------------------
-
-    Enter          send the current line (or run a /command)
-    Ctrl-N / Down  switch to the next channel
-    Ctrl-P / Up    switch to the previous channel
-    Backspace      delete a character
-    Ctrl-C / Ctrl-Q  quit
-
-Slash commands
---------------
-
-    /help                 show help
-    /create <name>        create a new channel
-    /join <name|id>       join a channel by name or number
-    /channels             refresh the channel list
-    /users                refresh the online-user list
-    /quit                 disconnect and exit
-"""
+# termchat terminal client - full-screen TUI using rich.
+# main thread does the rendering + reads stdin in raw mode, a background
+# thread drains the socket and updates ClientModel (lock-guarded).
+# keys: Enter sends, Ctrl-N/P or arrows switch channel, Ctrl-C/Q quits.
+# commands: /help /create /join /channels /users /quit
 
 import argparse
 import os
@@ -119,10 +85,8 @@ class NetworkClient:
     # -- synchronous request/response (used before the TUI starts) ----------
 
     def request(self, msg: dict, expected_type: str, timeout: float = 10.0):
-        """Send ``msg`` and block until a reply of ``expected_type`` arrives.
-
-        Only safe to use before :meth:`start_receiver` is running.
-        """
+        """Block until a reply of expected_type arrives. Only safe before
+        start_receiver() is running."""
         self.send(msg)
         deadline = time.time() + timeout
         while time.time() < deadline:

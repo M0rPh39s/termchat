@@ -1,15 +1,5 @@
-"""termchat TCP server.
-
-Threaded, one thread per connected client.  All shared state (the table
-of connected clients) is guarded by a single lock.  Persistence goes
-through :class:`~termchat.database.Database`, which serialises its own
-access, so the server code only has to worry about the in-memory client
-registry.
-
-Run it with::
-
-    python -m termchat.server --host 0.0.0.0 --port 9009 --db termchat.db
-"""
+# termchat TCP server. one thread per client, shared state behind a lock.
+# Database handles its own locking so we only worry about the client registry.
 
 import argparse
 import logging

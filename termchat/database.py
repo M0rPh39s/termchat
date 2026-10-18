@@ -1,11 +1,6 @@
-"""SQLite persistence layer for termchat.
-
-A single :class:`Database` instance is shared across all server threads.
-SQLite connections are not thread-safe for concurrent use, so every
-operation is serialised behind a lock.  Chat traffic is light and writes
-are tiny, so this is more than fast enough while keeping the code simple
-and correct.
-"""
+# one Database instance shared by all server threads. sqlite connections
+# aren't thread-safe so everything goes through self._lock - traffic here
+# is light enough that this is a non-issue perf-wise.
 
 import hashlib
 import hmac

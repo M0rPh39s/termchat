@@ -1,11 +1,7 @@
-"""Browser client for termchat: a tiny HTTP server that serves a
-single-page chat UI and bridges it to the chat :class:`~termchat.server.Server`
-over a hand-rolled WebSocket connection (see :mod:`termchat.ws`).
-
-Runs in the same process as the TCP server and shares the same
-``Server`` instance, so browser users, TUI users and GUI users are all
-in the same chat, seeing each other's presence and messages live.
-"""
+# browser client: tiny HTTP server serving a single-page chat UI, bridged
+# to the same Server instance over a hand-rolled websocket (see ws.py).
+# runs in-process with the TCP server so browser/TUI/GUI users all share
+# the same chat.
 
 import json
 import logging
@@ -20,7 +16,7 @@ log = logging.getLogger("termchat.web")
 
 
 class WSClientState(ClientState):
-    """A :class:`ClientState` whose ``send`` speaks WebSocket frames."""
+    """ClientState whose send() speaks websocket frames instead of raw TCP."""
 
     def send(self, msg: dict) -> bool:
         with self._send_lock:
