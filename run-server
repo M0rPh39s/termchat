@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Runs everything: the termchat TCP server, the browser (web) client, and
-# an ngrok tunnel so it's reachable from the public internet.
+# Runs everything: the termchat server + browser (web) client, and an ngrok
+# tunnel so it's reachable from the public internet.
 #
-# Usage: run-server [--no-ngrok]
+# Two ways to host the server:
+#   run-server              local venv (python .venv)
+#   run-server --docker     build + run the Docker container (docker compose)
+#
+# Usage: run-server [--docker] [--no-ngrok]
 #
 # Env overrides: TERMCHAT_HOST, TERMCHAT_PORT, TERMCHAT_WEB_PORT, TERMCHAT_DB
 set -uo pipefail
@@ -14,34 +18,77 @@ PORT="${TERMCHAT_PORT:-9009}"
 WEB_PORT="${TERMCHAT_WEB_PORT:-8080}"
 DB="${TERMCHAT_DB:-$PROJECT_DIR/termchat.db}"
 NGROK_LOG="/tmp/termchat-ngrok.log"
-USE_NGROK=1
-[[ "${1:-}" == "--no-ngrok" ]] && USE_NGROK=0
 
-if [[ ! -x "$VENV_PY" ]]; then
-    echo "no venv found at $PROJECT_DIR/.venv - run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
-    exit 1
-fi
+USE_NGROK=1
+USE_DOCKER=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-ngrok) USE_NGROK=0 ;;
+        --docker)   USE_DOCKER=1 ;;
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+            exit 0 ;;
+        *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
+    esac
+done
 
 SERVER_PID=""
 NGROK_PID=""
+COMPOSE=""   # set in docker mode
 
 cleanup() {
     echo
     echo "shutting down..."
     [[ -n "$NGROK_PID" ]] && kill "$NGROK_PID" 2>/dev/null
+    if [[ "$USE_DOCKER" -eq 1 && -n "$COMPOSE" ]]; then
+        (cd "$PROJECT_DIR" && $COMPOSE down)
+    fi
     [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
     wait 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
-echo "starting termchat server (tcp:$PORT, web:$WEB_PORT, db:$DB)..."
-"$VENV_PY" "$PROJECT_DIR/run_server.py" \
-    --host "$HOST" --port "$PORT" --web-port "$WEB_PORT" --db "$DB" -v &
-SERVER_PID=$!
+start_server_docker() {
+    # Pick the available compose invocation.
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE="docker-compose"
+    else
+        echo "docker compose not found - install Docker (with the compose plugin)" >&2
+        exit 1
+    fi
+    echo "building + starting termchat container (tcp:$PORT, web:$WEB_PORT)..."
+    # TERMCHAT_PORT / TERMCHAT_WEB_PORT feed the host-side port mapping in
+    # docker-compose.yml; the database persists on the termchat-data volume.
+    (cd "$PROJECT_DIR" && TERMCHAT_PORT="$PORT" TERMCHAT_WEB_PORT="$WEB_PORT" \
+        $COMPOSE up -d --build) || { echo "docker compose failed" >&2; exit 1; }
+}
 
-for _ in $(seq 1 40); do
+start_server_venv() {
+    if [[ ! -x "$VENV_PY" ]]; then
+        echo "no venv found at $PROJECT_DIR/.venv - run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+        echo "(or host it in Docker instead: run-server --docker)" >&2
+        exit 1
+    fi
+    echo "starting termchat server (tcp:$PORT, web:$WEB_PORT, db:$DB)..."
+    "$VENV_PY" "$PROJECT_DIR/run_server.py" \
+        --host "$HOST" --port "$PORT" --web-port "$WEB_PORT" --db "$DB" -v &
+    SERVER_PID=$!
+}
+
+if [[ "$USE_DOCKER" -eq 1 ]]; then
+    start_server_docker
+else
+    start_server_venv
+fi
+
+# Wait for the web port to accept connections.
+for _ in $(seq 1 60); do
     (exec 3<>"/dev/tcp/127.0.0.1/$WEB_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "server failed to start" >&2; exit 1; }
+    if [[ "$USE_DOCKER" -eq 0 ]]; then
+        kill -0 "$SERVER_PID" 2>/dev/null || { echo "server failed to start" >&2; exit 1; }
+    fi
     sleep 0.25
 done
 
@@ -69,10 +116,16 @@ if [[ "$USE_NGROK" -eq 1 ]]; then
             echo "  ngrok didn't report a URL yet - check $NGROK_LOG"
         fi
     else
-        echo "  (ngrok not on PATH - skipping public tunnel; pass nothing to retry, or --no-ngrok to silence this)"
+        echo "  (ngrok not on PATH - skipping public tunnel; pass --no-ngrok to silence this)"
     fi
 fi
 
 echo
 echo "tui/gui clients connect on port $PORT. press Ctrl+C to stop everything."
-wait "$SERVER_PID"
+
+if [[ "$USE_DOCKER" -eq 1 ]]; then
+    # Container runs detached; follow its logs so Ctrl+C tears everything down.
+    (cd "$PROJECT_DIR" && $COMPOSE logs -f)
+else
+    wait "$SERVER_PID"
+fi
