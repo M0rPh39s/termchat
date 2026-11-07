@@ -15,10 +15,19 @@ _PBKDF2_ITERATIONS = 200_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash   TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    -- End-to-end encryption identity (all nullable until the user sets it up).
+    -- public_key: base64 uncompressed ECDH P-256 point, handed out to peers.
+    -- enc_private_key: the user's PKCS8 private key, AES-GCM wrapped under a
+    --   passphrase the server never sees; stored only so a new device can
+    --   restore the identity. The server cannot decrypt it.
+    -- key_salt: PBKDF2 salt (hex) for that wrapping.
+    public_key      TEXT,
+    enc_private_key TEXT,
+    key_salt        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -87,6 +96,7 @@ class Database:
     def init_schema(self):
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
             # Seed default channels only if the table is empty.
             row = self._conn.execute(
@@ -99,6 +109,15 @@ class Database:
                     [(name, now) for name in _DEFAULT_CHANNELS],
                 )
                 self._conn.commit()
+
+    def _migrate(self):
+        """Add columns introduced after the original schema to pre-existing
+        databases. Called with the lock held."""
+        cols = {r["name"] for r in
+                self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        for col in ("public_key", "enc_private_key", "key_salt"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
 
     def close(self):
         with self._lock:
@@ -140,6 +159,46 @@ class Database:
         if not verify_password(password, row["password_hash"]):
             return None
         return row
+
+    # -- end-to-end encryption keys ------------------------------------------
+
+    def set_user_keys(self, user_id: int, public_key: str,
+                      enc_private_key: str, key_salt: str):
+        """Store (or replace) a user's encryption identity. Only ever handles
+        the public key and the already-wrapped private blob - never anything
+        the server could decrypt."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET public_key = ?, enc_private_key = ?, "
+                "key_salt = ? WHERE id = ?",
+                (public_key, enc_private_key, key_salt, user_id),
+            )
+            self._conn.commit()
+
+    def get_user_keys(self, user_id: int):
+        """Return ``{public_key, enc_private_key, key_salt}`` for a user, with
+        ``None`` values if they haven't set up encryption."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT public_key, enc_private_key, key_salt "
+                "FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_member_public_keys(self, channel_id: int):
+        """Public keys of every member of a channel that has an encryption
+        identity. Returned as ``[{user_id, username, public_key}, ...]`` -
+        the recipient set an encrypted message must be sealed to."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT u.id AS user_id, u.username, u.public_key "
+                "FROM memberships m "
+                "JOIN users u ON u.id = m.user_id "
+                "WHERE m.channel_id = ? AND u.public_key IS NOT NULL "
+                "ORDER BY u.id",
+                (channel_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- channels ------------------------------------------------------------
 

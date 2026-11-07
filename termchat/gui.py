@@ -16,6 +16,7 @@ from datetime import datetime
 from tkinter import font as tkfont
 
 from . import DEFAULT_HOST, DEFAULT_PORT, __version__
+from . import crypto
 from .protocol import ProtocolError, recv_msg, send_msg
 
 # ---------------------------------------------------------------------------
@@ -220,6 +221,110 @@ class NameDialog(tk.Toplevel):
         self.destroy()
 
 
+class EncryptionDialog(tk.Toplevel):
+    """Set up or unlock the user's end-to-end encryption identity.
+
+    On close, ``self.identity`` is a :class:`crypto.Identity` (or ``None``)
+    and ``self.mode`` is "on", "locked" or "off"."""
+
+    def __init__(self, parent, net, login):
+        super().__init__(parent)
+        self.net = net
+        self.login = login
+        self.identity = None
+        self.mode = "off"
+        self.has_keys = bool(login.get("has_keys"))
+
+        self.title("End-to-end encryption")
+        self.configure(bg=PANEL, padx=22, pady=18)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        tk.Label(self, text="🔒  End-to-end encryption", bg=PANEL, fg=ACCENT,
+                 font=(FONT_FAMILY, 13, "bold")).pack(anchor="w")
+
+        if self.has_keys:
+            blurb = ("Enter your encryption passphrase to read and send\n"
+                     "encrypted messages. Leave blank to continue locked.")
+        else:
+            blurb = ("Pick an encryption passphrase so your messages are\n"
+                     "readable only by channel members, not the server.\n"
+                     "It is NOT your login password and is never sent to\n"
+                     "the server — it cannot be recovered if forgotten.\n"
+                     "Leave blank to skip and send in plaintext.")
+        tk.Label(self, text=blurb, bg=PANEL, fg=FG_DIM, justify="left",
+                 font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 12))
+
+        self.pass_e = _entry(self, width=32, show="•")
+        self.pass_e.pack(fill="x", ipady=4)
+        self.confirm_e = None
+        if not self.has_keys:
+            tk.Label(self, text="confirm passphrase", bg=PANEL, fg=FG_DIM,
+                     font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(10, 1))
+            self.confirm_e = _entry(self, width=32, show="•")
+            self.confirm_e.pack(fill="x", ipady=4)
+
+        self.status = tk.Label(self, text="", bg=PANEL, fg=RED,
+                               font=(FONT_FAMILY, 9), wraplength=300,
+                               justify="left")
+        self.status.pack(anchor="w", pady=(10, 0))
+
+        row = tk.Frame(self, bg=PANEL)
+        row.pack(fill="x", pady=(12, 0))
+        _button(row, "Skip", self._skip).pack(side="right", padx=(8, 0))
+        _button(row, "Unlock" if self.has_keys else "Enable",
+                self._ok, primary=True).pack(side="right")
+
+        self.pass_e.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._skip())
+        self.pass_e.focus_set()
+        self.grab_set()
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width() // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"+{px - self.winfo_width() // 2}"
+                      f"+{py - self.winfo_height() // 2}")
+        self.wait_window()
+
+    def _skip(self):
+        self.identity = None
+        self.mode = "locked" if self.has_keys else "off"
+        self.destroy()
+
+    def _ok(self):
+        passphrase = self.pass_e.get()
+        if not passphrase:
+            self._skip()
+            return
+        if self.has_keys:
+            try:
+                self.identity = crypto.Identity.unlock(
+                    self.login["enc_private_key"], self.login["key_salt"],
+                    passphrase)
+                self.mode = "on"
+                self.destroy()
+            except Exception:
+                self.status.configure(text="Wrong passphrase, try again.")
+                self.pass_e.delete(0, "end")
+            return
+        # First-time setup.
+        if passphrase != self.confirm_e.get():
+            self.status.configure(text="Passphrases do not match.")
+            return
+        ident = crypto.Identity.generate()
+        enc_private, salt = ident.wrap_private_key(passphrase)
+        reply = self.net.request(
+            {"type": "set_keys", "public_key": ident.public_b64,
+             "enc_private_key": enc_private, "key_salt": salt},
+            "keys_set_result")
+        if reply is None or not reply.get("ok"):
+            self.status.configure(text="Could not save your key to the server.")
+            return
+        self.identity = ident
+        self.mode = "on"
+        self.destroy()
+
+
 # ---------------------------------------------------------------------------
 # Login screen
 # ---------------------------------------------------------------------------
@@ -376,9 +481,9 @@ class LoginFrame(tk.Frame):
             self._done(net, error=reply.get("error")
                        or reply.get("content") or "Login failed.")
             return
-        self._done(net, username=reply["username"])
+        self._done(net, login=reply)
 
-    def _done(self, net, username=None, error=None):
+    def _done(self, net, login=None, error=None):
         def apply():
             self._set_busy(False)
             if error:
@@ -386,7 +491,7 @@ class LoginFrame(tk.Frame):
                 self.set_status(error)
             else:
                 self.set_status("")
-                self.app.on_logged_in(net, username)
+                self.app.on_logged_in(net, login)
         try:
             self.app.after(0, apply)
         except tk.TclError:
@@ -400,10 +505,14 @@ class LoginFrame(tk.Frame):
 class ChatFrame(tk.Frame):
     SIDEBAR_W = 200
 
-    def __init__(self, app, username):
+    def __init__(self, app, username, identity=None, enc_mode="off"):
         super().__init__(app, bg=BG)
         self.app = app
         self.username = username
+
+        self.identity = identity        # crypto.Identity or None
+        self.enc_mode = enc_mode        # "on" | "locked" | "off"
+        self.member_keys = {}           # channel_id -> [public_key_b64, ...]
 
         self.channels = []              # channel dicts from the server
         self.active_channel_id = None
@@ -463,6 +572,14 @@ class ChatFrame(tk.Frame):
             header, text="Pick a channel on the left", bg=PANEL_2, fg=FG,
             font=(FONT_FAMILY, 12, "bold"))
         self.header_lbl.pack(side="left", padx=14)
+
+        _lock_txt = {"on": "🔒 e2e", "locked": "🔒 locked",
+                     "off": "🔓 plaintext"}.get(self.enc_mode, "")
+        _lock_fg = {"on": GREEN, "locked": YELLOW,
+                    "off": RED}.get(self.enc_mode, FG_DIM)
+        self.lock_lbl = tk.Label(header, text=_lock_txt, bg=PANEL_2,
+                                 fg=_lock_fg, font=(FONT_FAMILY, 10, "bold"))
+        self.lock_lbl.pack(side="right", padx=14)
 
         # Bottom rows are packed first (side="bottom") so the expanding
         # chat body can never squeeze them out of a small window.
@@ -528,21 +645,31 @@ class ChatFrame(tk.Frame):
                 self.set_status("")
                 self._render_channels()
                 self._render_messages()
+                self.app.net.send({"type": "get_member_keys",
+                                   "channel_id": msg["channel_id"]})
             else:
                 self.set_status(msg.get("error") or "could not join channel")
         elif mtype == "history":
             cid = msg["channel_id"]
-            self.messages[cid] = list(msg.get("messages", []))
+            self.messages[cid] = [self._decrypt(x)
+                                  for x in msg.get("messages", [])]
             if cid == self.active_channel_id:
                 self._render_messages()
         elif mtype == "message":
             cid = msg["channel_id"]
+            msg = self._decrypt(msg)
             self.messages.setdefault(cid, []).append(msg)
             if cid == self.active_channel_id:
                 self._append_message(msg)
+        elif mtype == "member_keys":
+            self.member_keys[msg["channel_id"]] = [
+                k["public_key"] for k in msg.get("keys", [])
+                if k.get("public_key")]
         elif mtype == "users":
-            if msg["channel_id"] == self.active_channel_id:
+            cid = msg["channel_id"]
+            if cid == self.active_channel_id:
                 self._render_users(msg.get("users", []))
+            self.app.net.send({"type": "get_member_keys", "channel_id": cid})
         elif mtype == "presence":
             cid = msg["channel_id"]
             verb = "joined" if msg.get("status") == "online" else "left"
@@ -566,6 +693,20 @@ class ChatFrame(tk.Frame):
 
     def set_status(self, text):
         self.status.configure(text=text)
+
+    def _decrypt(self, msg):
+        """Replace an encrypted message's content with plaintext (or a
+        placeholder we can't read). Pass other messages through untouched."""
+        content = msg.get("content", "")
+        if not crypto.is_encrypted(content):
+            return msg
+        if self.identity is None:
+            msg["content"] = "[encrypted - unlock to read]"
+        else:
+            plain = self.identity.decrypt(content)
+            msg["content"] = (plain if plain is not None
+                              else "[encrypted - not addressed to you]")
+        return msg
 
     def _render_channels(self):
         self.ch_list.delete(0, "end")
@@ -647,7 +788,18 @@ class ChatFrame(tk.Frame):
         if self.active_channel_id is None:
             self.set_status("join a channel first")
             return
-        if self.app.net.send({"type": "send_message", "content": text}):
+        if self.identity is not None:
+            recipients = list(self.member_keys.get(self.active_channel_id, []))
+            if self.identity.public_b64 not in recipients:
+                recipients.append(self.identity.public_b64)
+            try:
+                content = crypto.encrypt(text, recipients)
+            except ValueError:
+                self.set_status("no encryption keys available yet")
+                return
+        else:
+            content = text
+        if self.app.net.send({"type": "send_message", "content": content}):
             self.input_e.delete(0, "end")
         else:
             self.set_status("not connected")
@@ -696,9 +848,12 @@ class TermChatApp(tk.Tk):
         if status:
             login.set_status(status, color)
 
-    def on_logged_in(self, net: GuiNetwork, username: str):
+    def on_logged_in(self, net: GuiNetwork, login: dict):
         self.net = net
-        chat = ChatFrame(self, username)
+        # Set up / unlock encryption before the async receiver starts, so the
+        # dialog can use synchronous request/response for set_keys.
+        dlg = EncryptionDialog(self, net, login)
+        chat = ChatFrame(self, login["username"], dlg.identity, dlg.mode)
         self._swap(chat)
         net.start_receiver()
         net.send({"type": "list_channels"})
