@@ -1,0 +1,20 @@
+# termchat server via Docker Compose.
+#
+#   docker compose up -d        # build + start in the background
+#   docker compose logs -f      # follow the logs
+#   docker compose down         # stop (the named volume keeps the database)
+
+services:
+  termchat:
+    build: .
+    image: termchat
+    container_name: termchat
+    restart: unless-stopped
+    ports:
+      - "9009:9009"   # TCP clients (TUI / GUI)
+      - "8080:8080"   # browser client (http://localhost:8080)
+    volumes:
+      - termchat-data:/data
+
+volumes:
+  termchat-data:

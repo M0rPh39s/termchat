@@ -157,6 +157,30 @@ WantedBy=multi-user.target
 `sudo systemctl enable --now termchat`, then clients connect with
 `--host your.server.ip`.
 
+### Docker
+
+There's a `Dockerfile` and a `docker-compose.yml` that run the server (TCP
+plus the browser client) with the SQLite database on a named volume, so it
+survives restarts and rebuilds:
+
+```bash
+docker compose up -d        # build + start in the background
+docker compose logs -f      # follow the logs
+docker compose down         # stop (the volume keeps the database)
+```
+
+That exposes `9009` for TUI/GUI clients and `8080` for the browser client
+(`http://localhost:8080`). Plain `docker` works too:
+
+```bash
+docker build -t termchat .
+docker run -d --name termchat -p 9009:9009 -p 8080:8080 \
+    -v termchat-data:/data termchat
+```
+
+Override the command to change ports or drop the web client, e.g.
+`docker run ... termchat python run_server.py --host 0.0.0.0 --port 9009 --db /data/termchat.db`.
+
 Heads up: traffic is plaintext JSON over TCP (passwords are hashed at
 rest, but the wire isn't encrypted). If this is going over the open
 internet, tunnel it - SSH port forward, VPN, whatever. Haven't gotten
@@ -178,6 +202,7 @@ termchat/
 ├── init_db.py
 ├── run_server.py / run_client.py / run_gui.py
 ├── requirements.txt / pyproject.toml
+├── Dockerfile / docker-compose.yml / .dockerignore
 ```
 
 MIT.

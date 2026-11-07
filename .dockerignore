@@ -1,0 +1,22 @@
+# Keep the build context small and the image clean.
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+build
+dist
+*.spec
+# Local databases and their WAL/SHM sidecars - never bake these into an image.
+*.db
+*.db-wal
+*.db-shm
+# Editor / OS cruft
+.vscode
+.idea
+.DS_Store
