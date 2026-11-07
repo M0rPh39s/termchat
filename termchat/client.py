@@ -5,6 +5,8 @@
 # commands: /help /create /join /channels /users /quit
 
 import argparse
+import base64
+import json
 import os
 import select
 import socket
@@ -12,6 +14,25 @@ import sys
 import threading
 import time
 from datetime import datetime
+
+# Marker prefixing a chat message whose content is a file attachment.
+FILE_PREFIX = "TCFILE1:"
+
+
+def _parse_file(content):
+    """Return the attachment dict for a file message, else None."""
+    if not isinstance(content, str) or not content.startswith(FILE_PREFIX):
+        return None
+    try:
+        return json.loads(base64.b64decode(
+            content[len(FILE_PREFIX):]).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _make_file_content(info) -> str:
+    return FILE_PREFIX + base64.b64encode(
+        json.dumps(info).encode("utf-8")).decode("ascii")
 
 from rich.align import Align
 from rich.console import Console, Group
@@ -23,7 +44,6 @@ from rich.table import Table
 from rich.text import Text
 
 from . import DEFAULT_HOST, DEFAULT_PORT
-from . import crypto
 from .protocol import ProtocolError, recv_msg, send_msg
 
 # Colours cycled through to give each speaker a stable, distinct colour.
@@ -52,10 +72,6 @@ class ClientModel:
         self.input_buffer = ""
         self.status_line = ""
         self.running = True
-        # End-to-end encryption.
-        self.identity = None            # crypto.Identity once unlocked
-        self.enc_mode = "off"           # "off" | "on" | "locked"
-        self.member_keys = {}           # channel_id -> [public_key_b64, ...]
 
     def selected_channel(self):
         with self.lock:
@@ -67,10 +83,13 @@ class ClientModel:
 class NetworkClient:
     """Owns the socket and the background receive loop."""
 
-    def __init__(self, host, port, model: ClientModel):
+    def __init__(self, host, port, model: ClientModel,
+                 use_tls=False, cafile=None):
         self.host = host
         self.port = port
         self.model = model
+        self.use_tls = use_tls
+        self.cafile = cafile
         self.sock = None
         self._send_lock = threading.Lock()
         self._recv_thread = None
@@ -80,6 +99,11 @@ class NetworkClient:
 
     def connect(self):
         self.sock = socket.create_connection((self.host, self.port), timeout=10)
+        if self.use_tls:
+            from . import tls
+            ctx = tls.client_context(cafile=self.cafile,
+                                     insecure=not self.cafile)
+            self.sock = ctx.wrap_socket(self.sock, server_hostname=self.host)
         self.sock.settimeout(None)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
@@ -136,22 +160,6 @@ class NetworkClient:
                     self.model.status_line = "! disconnected from server"
                 self.model.running = False
 
-    def _decrypt_msg(self, msg: dict) -> dict:
-        """Replace an encrypted message's content with its plaintext (or a
-        placeholder when we can't read it). System messages pass through."""
-        content = msg.get("content", "")
-        if not crypto.is_encrypted(content):
-            return msg
-        ident = self.model.identity
-        if ident is None:
-            msg["content"] = "[encrypted - unlock to read]"
-        else:
-            plain = ident.decrypt(content)
-            msg["content"] = (plain if plain is not None
-                              else "[encrypted - not addressed to you]")
-        msg["encrypted"] = True
-        return msg
-
     def _handle(self, msg: dict):
         mtype = msg.get("type")
         m = self.model
@@ -172,34 +180,21 @@ class NetworkClient:
                     m.active_channel_id = msg["channel_id"]
                     m.active_channel_name = msg["name"]
                     m.status_line = f"joined #{msg['name']}"
-                # Learn who we can encrypt to in this channel.
-                self.send({"type": "get_member_keys",
-                           "channel_id": msg["channel_id"]})
             else:
                 with m.lock:
                     m.status_line = f"! {msg.get('error')}"
         elif mtype == "history":
             cid = msg["channel_id"]
-            msgs = [self._decrypt_msg(x) for x in msg.get("messages", [])]
             with m.lock:
-                m.messages[cid] = msgs
+                m.messages[cid] = msg.get("messages", [])
         elif mtype == "message":
             cid = msg["channel_id"]
-            msg = self._decrypt_msg(msg)
             with m.lock:
                 m.messages.setdefault(cid, []).append(msg)
-        elif mtype == "member_keys":
-            cid = msg["channel_id"]
-            with m.lock:
-                m.member_keys[cid] = [
-                    k["public_key"] for k in msg.get("keys", [])
-                    if k.get("public_key")]
         elif mtype == "users":
             cid = msg["channel_id"]
             with m.lock:
                 m.online[cid] = msg.get("users", [])
-            # Membership may have changed; refresh the recipient set.
-            self.send({"type": "get_member_keys", "channel_id": cid})
         elif mtype == "presence":
             cid = msg["channel_id"]
             verb = "joined" if msg.get("status") == "online" else "left"
@@ -213,6 +208,17 @@ class NetworkClient:
                 m.messages.setdefault(cid, []).append({
                     "system": True, "timestamp": int(time.time()),
                     "content": msg.get("content", "")})
+        elif mtype == "upload_result":
+            if msg.get("ok"):
+                self.send({"type": "send_message",
+                           "content": _make_file_content(
+                               {"url": msg.get("url"), "name": msg.get("name"),
+                                "size": msg.get("size")})})
+                with m.lock:
+                    m.status_line = f"uploaded {msg.get('name')}"
+            else:
+                with m.lock:
+                    m.status_line = f"! upload failed: {msg.get('error')}"
         elif mtype == "error":
             with m.lock:
                 m.status_line = f"! {msg.get('content')}"
@@ -223,8 +229,10 @@ class NetworkClient:
 # ---------------------------------------------------------------------------
 
 def login_screen(net: NetworkClient, console: Console) -> dict:
-    """Run the login/registration flow.  Returns the ``login_result`` reply
-    (which carries the username and the user's encryption key material)."""
+    """Run the login flow. Returns the ``login_result`` reply. Accounts are
+    created by an admin; there is no self-registration. The ``admin`` choice
+    asks the server for passwordless admin access, which only works when the
+    client is on the same host as the server (a loopback connection)."""
     console.clear()
     console.print(Panel(
         Align.center(Text("termchat", style="bold cyan")
@@ -234,29 +242,29 @@ def login_screen(net: NetworkClient, console: Console) -> dict:
     while True:
         console.print()
         choice = Prompt.ask(
-            "[bold]Choose[/bold]", choices=["login", "register", "quit"],
+            "[bold]Choose[/bold]", choices=["login", "admin", "quit"],
             default="login")
         if choice == "quit":
             console.print("bye!")
             raise SystemExit(0)
+
+        if choice == "admin":
+            reply = net.request({"type": "auto_login"}, "login_result")
+            if reply is None:
+                console.print("[red]no response from server[/red]")
+                continue
+            if not reply.get("ok"):
+                console.print(f"[red]{reply.get('error')}[/red] "
+                              "[dim](only works on the server host)[/dim]")
+                continue
+            console.print("[green]logged in as admin[/green]")
+            return reply
 
         username = Prompt.ask("username").strip()
         if not username:
             console.print("[red]username cannot be empty[/red]")
             continue
         password = Prompt.ask("password", password=True)
-
-        if choice == "register":
-            reply = net.request(
-                {"type": "register", "username": username, "password": password},
-                "register_result")
-            if reply is None:
-                console.print("[red]no response from server[/red]")
-                continue
-            if not reply.get("ok"):
-                console.print(f"[red]{reply.get('error') or reply.get('content')}[/red]")
-                continue
-            console.print("[green]account created — logging in...[/green]")
 
         reply = net.request(
             {"type": "login", "username": username, "password": password},
@@ -268,70 +276,6 @@ def login_screen(net: NetworkClient, console: Console) -> dict:
             console.print(f"[red]{reply.get('error') or reply.get('content')}[/red]")
             continue
         return reply
-
-
-def encryption_screen(net: NetworkClient, console: Console, login: dict):
-    """Set up or unlock the user's end-to-end encryption identity.
-
-    Returns ``(identity_or_None, mode)`` where mode is "on", "locked" or
-    "off".  A blank passphrase skips encryption for the session."""
-    console.print()
-    if login.get("has_keys"):
-        console.print(Panel(
-            Text("This account has end-to-end encryption set up.\n"
-                 "Enter your encryption passphrase to read and send "
-                 "encrypted messages.", style="cyan"),
-            border_style="cyan", title="🔒 encryption"))
-        for _ in range(3):
-            passphrase = Prompt.ask(
-                "encryption passphrase [dim](blank to skip)[/dim]",
-                password=True, default="", show_default=False)
-            if not passphrase:
-                console.print("[yellow]skipping — encrypted messages will "
-                              "show as locked[/yellow]")
-                return None, "locked"
-            try:
-                ident = crypto.Identity.unlock(
-                    login["enc_private_key"], login["key_salt"], passphrase)
-                console.print("[green]unlocked — end-to-end encryption on[/green]")
-                return ident, "on"
-            except Exception:
-                console.print("[red]wrong passphrase, try again[/red]")
-        console.print("[yellow]continuing locked[/yellow]")
-        return None, "locked"
-
-    # No identity yet: offer to create one.
-    console.print(Panel(
-        Text("Set up end-to-end encryption so your messages are readable "
-             "only by channel members — not the server.\n"
-             "Pick an encryption passphrase. It is NOT your login password "
-             "and is never sent to the server, so it cannot be recovered if "
-             "you forget it.", style="cyan"),
-        border_style="cyan", title="🔒 encryption"))
-    while True:
-        passphrase = Prompt.ask(
-            "new encryption passphrase [dim](blank to skip)[/dim]",
-            password=True, default="", show_default=False)
-        if not passphrase:
-            console.print("[yellow]skipping — messages will be sent in "
-                          "plaintext[/yellow]")
-            return None, "off"
-        confirm = Prompt.ask("confirm passphrase", password=True,
-                             default="", show_default=False)
-        if passphrase != confirm:
-            console.print("[red]passphrases do not match[/red]")
-            continue
-        ident = crypto.Identity.generate()
-        enc_private, salt = ident.wrap_private_key(passphrase)
-        reply = net.request(
-            {"type": "set_keys", "public_key": ident.public_b64,
-             "enc_private_key": enc_private, "key_salt": salt},
-            "keys_set_result")
-        if reply is None or not reply.get("ok"):
-            console.print("[red]could not save your key to the server[/red]")
-            return None, "off"
-        console.print("[green]encryption set up — end-to-end encryption on[/green]")
-        return ident, "on"
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +349,13 @@ class ChatTUI:
             line = Text()
             line.append(f"[{ts}] ", style="dim")
             line.append(f"{author}: ", style=f"bold {_color_for(author)}")
-            line.append(msg.get("content", ""))
+            finfo = _parse_file(msg.get("content", ""))
+            if finfo:
+                line.append(f"📎 {finfo.get('name', 'file')} ",
+                            style="bold cyan")
+                line.append(finfo.get("url", ""), style="underline blue")
+            else:
+                line.append(msg.get("content", ""))
             lines.append(line)
 
         body = Group(*lines) if lines else Align.center(
@@ -418,19 +368,13 @@ class ChatTUI:
         with m.lock:
             buf = m.input_buffer
             status = m.status_line
-            mode = m.enc_mode
         prompt = Text("> ", style="bold cyan")
         prompt.append(buf)
         prompt.append("_", style="blink")
         if status:
             prompt.append("    ")
             prompt.append(status, style="yellow")
-        lock = {"on": ("🔒 e2e", "green"),
-                "locked": ("🔒 locked", "yellow"),
-                "off": ("🔓 plain", "red")}.get(mode, ("", "dim"))
-        title = Text(lock[0], style=lock[1])
-        return Panel(prompt, border_style="blue", title=title,
-                     title_align="right")
+        return Panel(prompt, border_style="blue")
 
     def _render(self) -> Layout:
         layout = Layout()
@@ -474,25 +418,36 @@ class ChatTUI:
             self._send_chat(text)
 
     def _send_chat(self, text: str):
-        """Encrypt (if unlocked) and send a chat line to the active channel."""
+        """Send a chat line to the active channel."""
+        self.net.send({"type": "send_message", "content": text})
+
+    def _upload_file(self, path: str):
         m = self.model
+        path = os.path.expanduser(path.strip())
+        if not path:
+            with m.lock:
+                m.status_line = "usage: /upload <path>"
+            return
+        if m.active_channel_id is None:
+            with m.lock:
+                m.status_line = "! join a channel first"
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            with m.lock:
+                m.status_line = f"! can't read file: {exc}"
+            return
+        if len(data) > 10 * 1024 * 1024:
+            with m.lock:
+                m.status_line = "! file too large (max 10 MB)"
+            return
         with m.lock:
-            ident = m.identity
-            cid = m.active_channel_id
-            recipients = list(m.member_keys.get(cid, []))
-        if ident is not None:
-            # Always include ourselves so our own messages stay readable.
-            if ident.public_b64 not in recipients:
-                recipients.append(ident.public_b64)
-            try:
-                payload = crypto.encrypt(text, recipients)
-            except ValueError:
-                with m.lock:
-                    m.status_line = "! no encryption keys available yet"
-                return
-            self.net.send({"type": "send_message", "content": payload})
-        else:
-            self.net.send({"type": "send_message", "content": text})
+            m.status_line = f"uploading {os.path.basename(path)}..."
+        self.net.send({"type": "upload_file",
+                       "name": os.path.basename(path),
+                       "data": base64.b64encode(data).decode("ascii")})
 
     def _command(self, text: str):
         parts = text[1:].split(maxsplit=1)
@@ -505,14 +460,16 @@ class ChatTUI:
                 m.running = False
         elif cmd == "help":
             with m.lock:
-                m.status_line = ("cmds: /create <n> /join <n|id> /channels "
-                                 "/users /quit  |  Ctrl-N/P switch channel")
+                m.status_line = ("cmds: /create <n> /join <n|id> /upload <path> "
+                                 "/channels /users /quit  |  Ctrl-N/P switch")
         elif cmd == "create":
             if arg:
                 self.net.send({"type": "create_channel", "name": arg})
             else:
                 with m.lock:
-                    m.status_line = "usage: /create <name>"
+                    m.status_line = "usage: /create <name> (admin only)"
+        elif cmd == "upload":
+            self._upload_file(arg)
         elif cmd == "join":
             self._join_by_arg(arg)
         elif cmd == "channels":
@@ -639,6 +596,11 @@ def main(argv=None):
                         help=f"server host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"server port (default: {DEFAULT_PORT})")
+    parser.add_argument("--tls", action="store_true",
+                        help="connect over TLS (encrypted)")
+    parser.add_argument("--cafile", default=None,
+                        help="verify the server's TLS cert against this CA "
+                             "(default: accept self-signed)")
     args = parser.parse_args(argv)
 
     console = Console()
@@ -647,7 +609,8 @@ def main(argv=None):
         return 1
 
     model = ClientModel()
-    net = NetworkClient(args.host, args.port, model)
+    net = NetworkClient(args.host, args.port, model,
+                        use_tls=args.tls, cafile=args.cafile)
 
     try:
         net.connect()
@@ -657,15 +620,12 @@ def main(argv=None):
 
     try:
         login = login_screen(net, console)
-        identity, enc_mode = encryption_screen(net, console, login)
     except (KeyboardInterrupt, EOFError):
         console.print("\nbye!")
         return 0
 
     with model.lock:
         model.username = login["username"]
-        model.identity = identity
-        model.enc_mode = enc_mode
     username = login["username"]
 
     # Switch to async mode and enter the first channel automatically.

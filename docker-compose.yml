@@ -15,6 +15,16 @@ services:
       # override the host side with TERMCHAT_PORT / TERMCHAT_WEB_PORT.
       - "${TERMCHAT_PORT:-9009}:9009"   # TCP clients (TUI / GUI)
       - "${TERMCHAT_WEB_PORT:-8080}:8080"   # browser client
+    environment:
+      # The server reads these from the env (argparse defaults):
+      #   TERMCHAT_TLS=1        encrypt all connections with TLS
+      #   TERMCHAT_EPHEMERAL=1  wipe the db + uploads on shutdown
+      # Admin account (local host auto-logs in as admin without a password;
+      # these are only needed for remote admin login).
+      TERMCHAT_TLS: "${TERMCHAT_TLS:-0}"
+      TERMCHAT_EPHEMERAL: "${TERMCHAT_EPHEMERAL:-0}"
+      TERMCHAT_ADMIN_USER: "${TERMCHAT_ADMIN_USER:-admin}"
+      TERMCHAT_ADMIN_PASS: "${TERMCHAT_ADMIN_PASS:-admin}"
     volumes:
       - termchat-data:/data
 

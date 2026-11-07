@@ -5,8 +5,11 @@
 
 import json
 import logging
+import mimetypes
+import os
 import socketserver
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from . import ws as wsproto
@@ -27,8 +30,9 @@ class WSClientState(ClientState):
                 return False
 
 
-def _serve_ws_client(chat_server: Server, conn, addr):
+def _serve_ws_client(chat_server: Server, conn, addr, is_local=False):
     state = WSClientState(conn, addr)
+    state.is_local = is_local
     chat_server.register_client(state)
     log.info("browser connection from %s", addr)
     try:
@@ -83,7 +87,39 @@ def _make_handler(chat_server: Server):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/uploads/"):
+                self._serve_upload()
+                return
             self.send_error(404, "not found")
+
+        def _serve_upload(self):
+            # /uploads/<token>/<name> -> a file under the server's uploads dir.
+            rel = self.path[len("/uploads/"):].split("?", 1)[0]
+            rel = urllib.parse.unquote(rel)
+            base = os.path.realpath(chat_server.uploads_dir)
+            target = os.path.realpath(os.path.join(base, rel))
+            # Contain the path: never serve outside the uploads directory.
+            if target != base and not target.startswith(base + os.sep):
+                self.send_error(403, "forbidden")
+                return
+            if not os.path.isfile(target):
+                self.send_error(404, "not found")
+                return
+            ctype, _ = mimetypes.guess_type(target)
+            try:
+                with open(target, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                self.send_error(404, "not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            # Files are user-supplied: force download / no inline script exec.
+            self.send_header("Content-Security-Policy", "default-src 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _upgrade_to_websocket(self):
             if self.headers.get("Upgrade", "").lower() != "websocket":
@@ -94,6 +130,15 @@ def _make_handler(chat_server: Server):
                 self.send_error(400, "missing Sec-WebSocket-Key")
                 return
             accept = wsproto.accept_key(key)
+            # Safe local-admin detection: a genuine loopback peer that is NOT
+            # being proxied. ngrok (and any reverse proxy) always adds an
+            # X-Forwarded-For / Forwarded header, so tunnelled visitors - who
+            # also arrive from 127.0.0.1 - never count as local.
+            peer_ip = self.client_address[0] if self.client_address else ""
+            forwarded = bool(self.headers.get("X-Forwarded-For")
+                             or self.headers.get("Forwarded"))
+            is_local = (peer_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                        and not forwarded)
             self.send_response(101, "Switching Protocols")
             self.send_header("Upgrade", "websocket")
             self.send_header("Connection", "Upgrade")
@@ -104,7 +149,7 @@ def _make_handler(chat_server: Server):
             conn = self.connection
             addr = self.client_address
             self.close_connection = True
-            _serve_ws_client(chat_server, conn, addr)
+            _serve_ws_client(chat_server, conn, addr, is_local=is_local)
 
     return Handler
 
@@ -123,16 +168,22 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
             pass
 
 
-def run_web(chat_server: Server, host: str, port: int):
+def run_web(chat_server: Server, host: str, port: int, ssl_context=None):
     """Serve the browser client. Blocks; call via :func:`run_web_in_thread`."""
     httpd = _ThreadingHTTPServer((host, port), _make_handler(chat_server))
-    log.info("termchat browser client on http://%s:%s", host, port)
+    scheme = "http"
+    if ssl_context is not None:
+        httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    log.info("termchat browser client on %s://%s:%s", scheme, host, port)
     httpd.serve_forever()
 
 
-def run_web_in_thread(chat_server: Server, host: str, port: int) -> threading.Thread:
+def run_web_in_thread(chat_server: Server, host: str, port: int,
+                      ssl_context=None) -> threading.Thread:
     t = threading.Thread(
-        target=run_web, args=(chat_server, host, port), daemon=True)
+        target=run_web, args=(chat_server, host, port),
+        kwargs={"ssl_context": ssl_context}, daemon=True)
     t.start()
     return t
 
@@ -182,30 +233,47 @@ INDEX_HTML = r"""<!doctype html>
   #auth button:hover { filter: brightness(1.15); }
   #auth .msg { min-height: 18px; margin-top: 10px; font-size: 12px; color: var(--danger); }
 
-  /* ---- encryption gate ---- */
-  #enc {
-    width: min(360px, 92vw); padding: 24px; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 8px;
+  /* ---- admin panel ---- */
+  #admin {
+    position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.6);
+    display: flex; align-items: flex-start; justify-content: center;
+    overflow-y: auto; padding: 24px 12px;
   }
-  #enc h1 { margin: 0 0 4px; font-size: 18px; }
-  #enc p.sub { margin: 0 0 16px; color: var(--dim); font-size: 12px; line-height: 1.5; }
-  #enc input {
-    width: 100%; padding: 10px; margin-bottom: 10px; font-size: 16px;
-    background: #0d1117; border: 1px solid var(--border); border-radius: 4px;
-    color: var(--text); font-family: inherit;
+  .admin-box {
+    width: min(560px, 96vw); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 20px;
   }
-  #enc .row { display: flex; gap: 8px; }
-  #enc button {
-    flex: 1; padding: 10px; min-height: 44px; border-radius: 4px; border: 1px solid var(--border);
+  .admin-head { display: flex; align-items: center; justify-content: space-between; }
+  .admin-head h1 { margin: 0; font-size: 18px; }
+  #btn-admin-close { background: none; border: none; color: var(--dim); font-size: 24px; cursor: pointer; line-height: 1; }
+  #admin h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); margin: 18px 0 8px; }
+  .admin-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .admin-row input[type=text], .admin-row input:not([type]), .admin-row input[type=password], .admin-row select {
+    flex: 1; min-width: 120px; padding: 8px 10px; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 4px; color: var(--text); font: inherit;
+  }
+  #admin button {
+    padding: 8px 14px; min-height: 40px; border-radius: 4px; border: 1px solid var(--border);
     background: #1c2128; color: var(--text); font: inherit; cursor: pointer;
   }
-  #enc button.primary { background: var(--accent); border-color: var(--accent); color: #06111f; font-weight: 600; }
-  #enc button:hover { filter: brightness(1.15); }
-  #enc .msg { min-height: 18px; margin-top: 10px; font-size: 12px; color: var(--danger); }
-  #lock-ind { margin-left: auto; font-size: 12px; font-weight: 600; }
-  #lock-ind.on { color: var(--online); }
-  #lock-ind.locked { color: #e5c07b; }
-  #lock-ind.off { color: var(--danger); }
+  #admin button.primary { background: var(--accent); border-color: var(--accent); color: #06111f; font-weight: 600; }
+  #admin button:hover { filter: brightness(1.15); }
+  #admin .msg { min-height: 16px; margin-top: 8px; font-size: 12px; color: var(--danger); }
+  #admin .msg.ok { color: var(--online); }
+  #admin ul { list-style: none; margin: 0; padding: 0; }
+  #admin-users li { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  #admin-users li .role { color: var(--dim); font-size: 11px; }
+  #admin-users li .grow { flex: 1; }
+  #admin-users li button { min-height: 32px; padding: 4px 10px; }
+  .member-pick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .member-pick li { padding: 0; border: 0; }
+  .member-pick label { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: #0d1117; border: 1px solid var(--border); border-radius: 12px; font-size: 12px; cursor: pointer; }
+  .chk { display: inline-flex; align-items: center; gap: 4px; color: var(--dim); font-size: 13px; }
+  #btn-attach { padding: 10px 12px; min-height: 44px; border-radius: 4px; border: 1px solid var(--border); background: #1c2128; color: var(--text); cursor: pointer; }
+  #btn-attach:disabled { opacity: .5; cursor: default; }
+  #chan-lock { font-size: 13px; }
+  .msg-line a { color: var(--accent); }
+  .msg-line img.att { max-width: 240px; max-height: 240px; border-radius: 6px; display: block; margin-top: 4px; }
 
   /* ---- chat screen ---- */
   #chat {
@@ -309,21 +377,9 @@ INDEX_HTML = r"""<!doctype html>
   <input id="password" type="password" placeholder="password" autocomplete="current-password">
   <div class="row">
     <button id="btn-login" class="primary">Log in</button>
-    <button id="btn-register">Register</button>
   </div>
+  <p class="sub" style="margin-top:12px">Accounts are created by an admin.</p>
   <div class="msg" id="auth-msg"></div>
-</div>
-
-<div id="enc" class="hidden">
-  <h1>&#128274; End-to-end encryption</h1>
-  <p class="sub" id="enc-sub"></p>
-  <input id="enc-pass" type="password" placeholder="encryption passphrase" autocomplete="off">
-  <input id="enc-confirm" type="password" placeholder="confirm passphrase" autocomplete="off">
-  <div class="row">
-    <button id="btn-enc-ok" class="primary">Enable</button>
-    <button id="btn-enc-skip">Skip</button>
-  </div>
-  <div class="msg" id="enc-msg"></div>
 </div>
 
 <div id="chat" class="hidden">
@@ -336,16 +392,59 @@ INDEX_HTML = r"""<!doctype html>
     <ul id="user-list"></ul>
     <div id="whoami">
       <span id="me"></span>
-      <button id="btn-logout">log out</button>
+      <span>
+        <button id="btn-admin" class="hidden">admin</button>
+        <button id="btn-logout">log out</button>
+      </span>
     </div>
   </div>
   <div id="main">
-    <div id="channel-header"><button id="menu-btn" aria-label="channels">&#9776;</button><span id="channel-name">#</span><span id="lock-ind" class="off"></span></div>
+    <div id="channel-header"><button id="menu-btn" aria-label="channels">&#9776;</button><span id="channel-name">#</span><span id="chan-lock" class="hidden" title="private channel">&#128274;</span></div>
     <div id="messages"></div>
     <div id="input-row">
+      <input id="file-input" type="file" class="hidden">
+      <button id="btn-attach" title="attach a file" disabled>&#128206;</button>
       <input id="msg-input" placeholder="type a message and press Enter" disabled>
       <button id="btn-send" disabled>Send</button>
     </div>
+  </div>
+</div>
+
+<div id="admin" class="hidden">
+  <div class="admin-box">
+    <div class="admin-head"><h1>Admin</h1><button id="btn-admin-close">&times;</button></div>
+
+    <h2>Create account</h2>
+    <div class="admin-row">
+      <input id="nu-name" placeholder="username" autocomplete="off">
+      <input id="nu-pass" type="password" placeholder="password" autocomplete="new-password">
+      <select id="nu-role"><option value="user">user</option><option value="admin">admin</option></select>
+      <button id="btn-nu-create" class="primary">Create</button>
+    </div>
+    <div class="msg" id="nu-msg"></div>
+
+    <h2>Users</h2>
+    <ul id="admin-users"></ul>
+
+    <h2>Create channel</h2>
+    <div class="admin-row">
+      <input id="nc-name" placeholder="channel name">
+      <label class="chk"><input id="nc-private" type="checkbox"> private</label>
+      <button id="btn-nc-create" class="primary">Create</button>
+    </div>
+    <p class="sub" id="nc-members-hint hidden" style="margin:4px 0">Members (private channels only):</p>
+    <ul id="nc-members" class="member-pick"></ul>
+    <div class="msg" id="nc-msg"></div>
+
+    <h2>Channel access</h2>
+    <p class="sub">Edit who can see an existing private channel.</p>
+    <div class="admin-row">
+      <select id="ca-channel"></select>
+      <button id="btn-ca-load">Load</button>
+      <button id="btn-ca-save" class="primary">Save access</button>
+    </div>
+    <ul id="ca-members" class="member-pick"></ul>
+    <div class="msg" id="ca-msg"></div>
   </div>
 </div>
 
@@ -354,107 +453,6 @@ INDEX_HTML = r"""<!doctype html>
   "use strict";
   const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
   document.getElementById("auth-target").textContent = location.host;
-
-  // ---- end-to-end encryption (WebCrypto, interoperable with crypto.py) ----
-  const TCE = (function () {
-    const subtle = (globalThis.crypto || {}).subtle;
-    const PREFIX = "TCE1:";
-    const ITER = 200000;
-    const INFO = new TextEncoder().encode("termchat-wrap-v1");
-    const EC = { name: "ECDH", namedCurve: "P-256" };
-    const rand = (n) => globalThis.crypto.getRandomValues(new Uint8Array(n));
-
-    const abToB64 = (buf) => { const b = new Uint8Array(buf); let s = ""; for (const x of b) s += String.fromCharCode(x); return btoa(s); };
-    const b64ToU8 = (b64) => { const s = atob(b64); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
-    const b64url = (buf) => abToB64(buf).replace(/\+/g, "-").replace(/\//g, "_");
-    const hex = (u8) => [...u8].map((x) => x.toString(16).padStart(2, "0")).join("");
-    const unhex = (h) => { const u = new Uint8Array(h.length / 2); for (let i = 0; i < u.length; i++) u[i] = parseInt(h.substr(i * 2, 2), 16); return u; };
-
-    const supported = () => !!(subtle && subtle.deriveBits);
-    const isEncrypted = (c) => typeof c === "string" && c.startsWith(PREFIX);
-
-    async function fingerprint(publicB64) {
-      return b64url(await subtle.digest("SHA-256", b64ToU8(publicB64))).slice(0, 16);
-    }
-    const importPub = (b64) => subtle.importKey("raw", b64ToU8(b64), EC, true, []);
-    const aesKey = (raw) => subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
-    async function wrapKeyFromPass(passphrase, salt) {
-      const base = await subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-      return subtle.deriveKey({ name: "PBKDF2", salt, iterations: ITER, hash: "SHA-256" }, base,
-                              { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-    }
-    async function deriveWrap(privKey, pubKey, epkRaw) {
-      const shared = await subtle.deriveBits({ name: "ECDH", public: pubKey }, privKey, 256);
-      const hk = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
-      const bits = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: epkRaw, info: INFO }, hk, 256);
-      return aesKey(bits);
-    }
-    async function identityFrom(priv) {
-      const jwk = await subtle.exportKey("jwk", priv);
-      const pub = await subtle.importKey("jwk", { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y }, EC, true, []);
-      const publicB64 = abToB64(await subtle.exportKey("raw", pub));
-      return { priv, publicB64, fingerprint: await fingerprint(publicB64) };
-    }
-
-    async function generateIdentity() {
-      const kp = await subtle.generateKey(EC, true, ["deriveBits"]);
-      return identityFrom(kp.privateKey);
-    }
-    async function wrapPrivateKey(identity, passphrase) {
-      const salt = rand(16);
-      const wk = await wrapKeyFromPass(passphrase, salt);
-      const pkcs8 = await subtle.exportKey("pkcs8", identity.priv);
-      const iv = rand(12);
-      const ct = await subtle.encrypt({ name: "AES-GCM", iv }, wk, pkcs8);
-      const blob = new Uint8Array(12 + ct.byteLength);
-      blob.set(iv, 0); blob.set(new Uint8Array(ct), 12);
-      return { encPrivateB64: abToB64(blob), saltHex: hex(salt) };
-    }
-    async function unlock(encPrivateB64, saltHex, passphrase) {
-      const wk = await wrapKeyFromPass(passphrase, unhex(saltHex));
-      const blob = b64ToU8(encPrivateB64);
-      const pkcs8 = await subtle.decrypt({ name: "AES-GCM", iv: blob.slice(0, 12) }, wk, blob.slice(12));
-      const priv = await subtle.importKey("pkcs8", pkcs8, EC, true, ["deriveBits"]);
-      return identityFrom(priv);
-    }
-    async function encrypt(plaintext, recipientsB64) {
-      const seen = new Set(); const recips = [];
-      for (const pb of recipientsB64) {
-        if (!pb) continue;
-        const fp = await fingerprint(pb);
-        if (seen.has(fp)) continue; seen.add(fp);
-        try { recips.push([fp, await importPub(pb)]); } catch (e) { /* skip bad key */ }
-      }
-      if (!recips.length) throw new Error("no valid recipients");
-      const ck = rand(32);
-      const iv = rand(12);
-      const ct = await subtle.encrypt({ name: "AES-GCM", iv }, await aesKey(ck), new TextEncoder().encode(plaintext));
-      const eph = await subtle.generateKey(EC, true, ["deriveBits"]);
-      const epkRaw = new Uint8Array(await subtle.exportKey("raw", eph.publicKey));
-      const slots = {};
-      for (const [fp, pub] of recips) {
-        const wk = await deriveWrap(eph.privateKey, pub, epkRaw);
-        const wiv = rand(12);
-        const wct = await subtle.encrypt({ name: "AES-GCM", iv: wiv }, wk, ck);
-        slots[fp] = { iv: abToB64(wiv), k: abToB64(wct) };
-      }
-      const env = { v: 1, epk: abToB64(epkRaw), iv: abToB64(iv), ct: abToB64(ct), r: slots };
-      return PREFIX + abToB64(new TextEncoder().encode(JSON.stringify(env)));
-    }
-    async function decrypt(content, identity) {
-      if (!isEncrypted(content)) return content;
-      try {
-        const env = JSON.parse(new TextDecoder().decode(b64ToU8(content.slice(PREFIX.length))));
-        const slot = env.r[identity.fingerprint];
-        if (!slot) return null;
-        const wk = await deriveWrap(identity.priv, await importPub(env.epk), b64ToU8(env.epk));
-        const ck = await subtle.decrypt({ name: "AES-GCM", iv: b64ToU8(slot.iv) }, wk, b64ToU8(slot.k));
-        const pt = await subtle.decrypt({ name: "AES-GCM", iv: b64ToU8(env.iv) }, await aesKey(ck), b64ToU8(env.ct));
-        return new TextDecoder().decode(pt);
-      } catch (e) { return null; }
-    }
-    return { supported, isEncrypted, generateIdentity, wrapPrivateKey, unlock, encrypt, decrypt };
-  })();
 
   const el = (id) => document.getElementById(id);
   const authScreen = el("auth"), chatScreen = el("chat");
@@ -465,15 +463,23 @@ INDEX_HTML = r"""<!doctype html>
   const msgInput = el("msg-input"), sendBtn = el("btn-send");
   const meLabel = el("me");
   const menuBtn = el("menu-btn"), sidebarBackdrop = el("sidebar-backdrop");
-  const encScreen = el("enc"), encSub = el("enc-sub"), encMsg = el("enc-msg");
-  const encPass = el("enc-pass"), encConfirm = el("enc-confirm");
-  const btnEncOk = el("btn-enc-ok"), btnEncSkip = el("btn-enc-skip");
-  const lockInd = el("lock-ind");
+  const newChannelBtn = el("new-channel");
+  const attachBtn = el("btn-attach"), fileInput = el("file-input");
+  const adminBtn = el("btn-admin"), adminModal = el("admin"), chanLock = el("chan-lock");
 
-  let identity = null;          // TCE identity once unlocked
-  let encReady = false;         // encryption gate resolved -> safe to join
-  let memberKeys = {};          // channel_id -> [public_key_b64, ...]
-  let pendingKeysSet = null;    // resolver for set_keys round-trip
+  const FILE_PREFIX = "TCFILE1:";
+  const b64enc = (s) => btoa(unescape(encodeURIComponent(s)));
+  const b64dec = (s) => decodeURIComponent(escape(atob(s)));
+  function makeFileContent(info) { return FILE_PREFIX + b64enc(JSON.stringify(info)); }
+  function parseFile(content) {
+    if (typeof content !== "string" || !content.startsWith(FILE_PREFIX)) return null;
+    try { return JSON.parse(b64dec(content.slice(FILE_PREFIX.length))); }
+    catch (e) { return null; }
+  }
+
+  let isAdmin = false;
+  let usersCache = [];          // [{id, username, role}]
+  const nuMsg = el("nu-msg"), ncMsg = el("nc-msg"), caMsg = el("ca-msg");
 
   function openSidebar() { chatScreen.classList.add("sidebar-open"); }
   function closeSidebar() { chatScreen.classList.remove("sidebar-open"); }
@@ -484,10 +490,17 @@ INDEX_HTML = r"""<!doctype html>
   let channels = [];
   let currentChannelId = null;
   let currentUsername = null;
-  let pendingRegisterThenLogin = false;
 
+  let skipAuto = false;   // set after an explicit logout so we don't re-grab admin
   function connect() {
     ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      // Try passwordless admin login first; the server grants it only to a
+      // genuine local (non-tunnelled) peer and otherwise refuses, which
+      // simply drops us onto the normal login form.
+      if (skipAuto) { authScreen.classList.remove("hidden"); return; }
+      send({ type: "auto_login" });
+    };
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -496,11 +509,9 @@ INDEX_HTML = r"""<!doctype html>
     ws.onclose = () => {
       authMsg.textContent = "disconnected from server";
       chatScreen.classList.add("hidden");
-      encScreen.classList.add("hidden");
       authScreen.classList.remove("hidden");
       msgInput.disabled = true;
       sendBtn.disabled = true;
-      identity = null; encReady = false; memberKeys = {};
     };
     ws.onerror = () => { authMsg.textContent = "connection error"; };
   }
@@ -511,40 +522,27 @@ INDEX_HTML = r"""<!doctype html>
 
   function handleMessage(msg) {
     switch (msg.type) {
-      case "register_result":
-        if (!msg.ok) {
-          authMsg.textContent = msg.error || "registration failed";
-          pendingRegisterThenLogin = false;
-        } else if (pendingRegisterThenLogin) {
-          pendingRegisterThenLogin = false;
-          send({ type: "login", username: usernameInput.value.trim(), password: passwordInput.value });
-        }
-        break;
-
       case "login_result":
         if (!msg.ok) {
+          // A refused passwordless auto-login just means "log in normally" -
+          // show the form quietly rather than as an error.
+          if (msg.auto) { authScreen.classList.remove("hidden"); return; }
           authMsg.textContent = msg.error || "login failed";
           return;
         }
         currentUsername = msg.username;
-        meLabel.textContent = currentUsername;
+        isAdmin = !!msg.is_admin;
+        meLabel.textContent = currentUsername + (isAdmin ? " (admin)" : "");
+        adminBtn.classList.toggle("hidden", !isAdmin);
+        newChannelBtn.classList.toggle("hidden", !isAdmin);
         authScreen.classList.add("hidden");
-        startEncryptionGate(msg);
-        break;
-
-      case "keys_set_result":
-        if (pendingKeysSet) { pendingKeysSet(msg); pendingKeysSet = null; }
-        break;
-
-      case "member_keys":
-        memberKeys[msg.channel_id] = (msg.keys || [])
-          .map((k) => k.public_key).filter(Boolean);
+        revealChat();
         break;
 
       case "channels":
         channels = msg.channels;
         renderChannelList();
-        if (encReady && currentChannelId === null && channels.length > 0) {
+        if (currentChannelId === null && channels.length > 0) {
           joinChannel(channels[0].id);
         }
         break;
@@ -554,6 +552,7 @@ INDEX_HTML = r"""<!doctype html>
           channels.push(msg.channel);
         }
         renderChannelList();
+        renderAccessChannelOptions();
         break;
 
       case "join_result":
@@ -563,9 +562,37 @@ INDEX_HTML = r"""<!doctype html>
         }
         currentChannelId = msg.channel_id;
         channelHeader.textContent = "#" + msg.name;
+        const cObj = channels.find((c) => c.id === msg.channel_id);
+        chanLock.classList.toggle("hidden", !(cObj && cObj.is_private));
         messages.innerHTML = "";
         renderChannelList();
-        send({ type: "get_member_keys", channel_id: msg.channel_id });
+        break;
+
+      case "upload_result":
+        if (!msg.ok) { addSystemLine(msg.error || "upload failed", true); break; }
+        send({ type: "send_message", content: makeFileContent(
+          { url: msg.url, name: msg.name, size: msg.size }) });
+        break;
+
+      case "admin_users":
+        usersCache = msg.users || [];
+        renderAdminUsers();
+        renderMemberPick();
+        break;
+
+      case "admin_create_result":
+        nuMsg.textContent = msg.ok ? "created" : (msg.error || "failed");
+        nuMsg.className = "msg" + (msg.ok ? " ok" : "");
+        if (msg.ok) { el("nu-name").value = ""; el("nu-pass").value = ""; }
+        break;
+
+      case "admin_action_result":
+        caMsg.textContent = msg.ok ? "saved" : (msg.error || "failed");
+        caMsg.className = "msg" + (msg.ok ? " ok" : "");
+        break;
+
+      case "channel_access":
+        renderChannelAccess(msg.channel_id, msg.members || []);
         break;
 
       case "history":
@@ -575,13 +602,13 @@ INDEX_HTML = r"""<!doctype html>
 
       case "message":
         if (msg.channel_id !== currentChannelId) return;
-        addMessageLine(msg).then(scrollToBottom);
+        addMessageLine(msg);
+        scrollToBottom();
         break;
 
       case "users":
         if (msg.channel_id !== currentChannelId) return;
         renderUserList(msg.users);
-        send({ type: "get_member_keys", channel_id: msg.channel_id });
         break;
 
       case "presence":
@@ -627,32 +654,47 @@ INDEX_HTML = r"""<!doctype html>
     return d.toTimeString().slice(0, 8);
   }
 
-  async function decryptContent(raw) {
-    if (!TCE.isEncrypted(raw)) return raw;
-    if (!identity) return "[encrypted - unlock to read]";
-    const pt = await TCE.decrypt(raw, identity);
-    return pt === null ? "[encrypted - not addressed to you]" : pt;
-  }
-
-  async function addMessageLine(m) {
-    const text = await decryptContent(m.content || "");
+  function addMessageLine(m) {
     const div = document.createElement("div");
     div.className = "msg-line";
     const ts = document.createElement("span");
     ts.className = "ts"; ts.textContent = "[" + fmtTime(m.timestamp) + "]";
     const user = document.createElement("span");
     user.className = "user"; user.textContent = m.username + ":";
-    const content = document.createElement("span");
-    content.textContent = " " + text;
-    div.append(ts, user, content);
+    div.append(ts, user);
+    const file = parseFile(m.content || "");
+    if (file) {
+      const link = document.createElement("a");
+      link.href = file.url; link.target = "_blank"; link.rel = "noopener";
+      link.textContent = " \u{1F4CE} " + file.name
+        + (file.size ? " (" + fmtSize(file.size) + ")" : "");
+      div.append(link);
+      if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name)) {
+        const img = document.createElement("img");
+        img.className = "att"; img.src = file.url; img.alt = file.name;
+        const wrap = document.createElement("a");
+        wrap.href = file.url; wrap.target = "_blank"; wrap.rel = "noopener";
+        wrap.append(img); div.append(wrap);
+      }
+    } else {
+      const content = document.createElement("span");
+      content.textContent = " " + (m.content || "");
+      div.append(content);
+    }
     messages.appendChild(div);
   }
 
-  async function renderHistory(channelId, msgs) {
+  function fmtSize(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  function renderHistory(channelId, msgs) {
     messages.innerHTML = "";
     for (const m of msgs) {
-      if (channelId !== currentChannelId) return;  // switched away mid-decrypt
-      await addMessageLine(m);
+      if (channelId !== currentChannelId) return;  // switched away
+      addMessageLine(m);
     }
     scrollToBottom();
   }
@@ -674,52 +716,31 @@ INDEX_HTML = r"""<!doctype html>
     send({ type: "login", username: u, password: p });
   };
 
-  el("btn-register").onclick = () => {
-    const u = usernameInput.value.trim(), p = passwordInput.value;
-    if (!u || !p) { authMsg.textContent = "enter a username and password"; return; }
-    authMsg.textContent = "";
-    pendingRegisterThenLogin = true;
-    send({ type: "register", username: u, password: p });
-  };
-
   el("btn-logout").onclick = () => {
     send({ type: "logout" });
+    skipAuto = true;
     if (ws) ws.close();
     closeSidebar();
     currentChannelId = null;
     currentUsername = null;
+    isAdmin = false;
     channels = [];
     channelList.innerHTML = "";
     userList.innerHTML = "";
     messages.innerHTML = "";
-    identity = null; encReady = false; memberKeys = {};
     chatScreen.classList.add("hidden");
-    encScreen.classList.add("hidden");
+    adminModal.classList.add("hidden");
     authScreen.classList.remove("hidden");
     passwordInput.value = "";
     connect();
   };
 
-  el("new-channel").onclick = () => {
-    const name = prompt("New channel name:");
-    if (name && name.trim()) send({ type: "create_channel", name: name.trim() });
-  };
+  newChannelBtn.onclick = () => { if (isAdmin) openAdmin(); };
 
-  async function sendCurrentMessage() {
+  function sendCurrentMessage() {
     const text = msgInput.value;
     if (!text.trim()) return;
-    let content = text;
-    if (identity) {
-      const recips = (memberKeys[currentChannelId] || []).slice();
-      if (!recips.includes(identity.publicB64)) recips.push(identity.publicB64);
-      try {
-        content = await TCE.encrypt(text, recips);
-      } catch (e) {
-        addSystemLine("no encryption keys available yet", true);
-        return;
-      }
-    }
-    send({ type: "send_message", content: content });
+    send({ type: "send_message", content: text });
     msgInput.value = "";
   }
   sendBtn.onclick = sendCurrentMessage;
@@ -732,102 +753,133 @@ INDEX_HTML = r"""<!doctype html>
     });
   });
 
-  function setLock(mode) {
-    lockInd.className = mode;
-    lockInd.textContent = mode === "on" ? "\u{1F512} e2e"
-      : mode === "locked" ? "\u{1F512} locked" : "\u{1F513} plaintext";
+  // ---- file upload ----
+  attachBtn.onclick = () => fileInput.click();
+  fileInput.onchange = () => {
+    const f = fileInput.files && fileInput.files[0];
+    fileInput.value = "";
+    if (!f) return;
+    if (f.size > 10 * 1024 * 1024) { addSystemLine("file too large (max 10 MB)", true); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = String(reader.result).split(",", 2)[1] || "";
+      send({ type: "upload_file", name: f.name, data: b64 });
+    };
+    reader.onerror = () => addSystemLine("could not read file", true);
+    reader.readAsDataURL(f);
+  };
+
+  // ---- admin panel ----
+  function openAdmin() {
+    adminModal.classList.remove("hidden");
+    nuMsg.textContent = ""; ncMsg.textContent = ""; caMsg.textContent = "";
+    send({ type: "admin_list_users" });
+    renderAccessChannelOptions();
+  }
+  adminBtn.onclick = openAdmin;
+  el("btn-admin-close").onclick = () => adminModal.classList.add("hidden");
+  adminModal.onclick = (e) => { if (e.target === adminModal) adminModal.classList.add("hidden"); };
+
+  function renderAdminUsers() {
+    const ul = el("admin-users"); ul.innerHTML = "";
+    usersCache.forEach((u) => {
+      const li = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "grow"; name.textContent = u.username;
+      const role = document.createElement("span");
+      role.className = "role"; role.textContent = u.role;
+      const del = document.createElement("button");
+      del.textContent = "delete";
+      del.onclick = () => {
+        if (u.username === currentUsername) { return; }
+        if (confirm("Delete user " + u.username + "?"))
+          send({ type: "admin_delete_user", user_id: u.id });
+      };
+      li.append(name, role, del);
+      ul.appendChild(li);
+    });
   }
 
+  function renderMemberPick() {
+    // Checkboxes of non-admin... actually all users, for new private channel.
+    const ul = el("nc-members"); ul.innerHTML = "";
+    usersCache.forEach((u) => {
+      const li = document.createElement("li");
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = u.id; cb.dataset.pick = "nc";
+      label.append(cb, document.createTextNode(u.username));
+      li.append(label); ul.appendChild(li);
+    });
+  }
+
+  el("btn-nu-create").onclick = () => {
+    const u = el("nu-name").value.trim(), p = el("nu-pass").value;
+    const role = el("nu-role").value;
+    if (!u || !p) { nuMsg.textContent = "username and password required"; nuMsg.className = "msg"; return; }
+    send({ type: "admin_create_user", username: u, password: p, role: role });
+  };
+
+  el("btn-nc-create").onclick = () => {
+    const name = el("nc-name").value.trim();
+    if (!name) { ncMsg.textContent = "channel name required"; ncMsg.className = "msg"; return; }
+    const isPriv = el("nc-private").checked;
+    const members = [...document.querySelectorAll('input[data-pick="nc"]:checked')]
+      .map((c) => parseInt(c.value, 10));
+    send({ type: "create_channel", name: name, is_private: isPriv, members: members });
+    ncMsg.textContent = "created"; ncMsg.className = "msg ok";
+    el("nc-name").value = ""; el("nc-private").checked = false;
+    document.querySelectorAll('input[data-pick="nc"]:checked').forEach((c) => c.checked = false);
+  };
+
+  function renderAccessChannelOptions() {
+    const sel = el("ca-channel"); if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    channels.filter((c) => c.is_private).forEach((c) => {
+      const opt = document.createElement("option");
+      opt.value = c.id; opt.textContent = "# " + c.name;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+  }
+
+  el("btn-ca-load").onclick = () => {
+    const cid = parseInt(el("ca-channel").value, 10);
+    if (cid) send({ type: "admin_get_channel_access", channel_id: cid });
+  };
+
+  function renderChannelAccess(channelId, memberIds) {
+    const set = new Set(memberIds);
+    const ul = el("ca-members"); ul.innerHTML = "";
+    ul.dataset.channel = channelId;
+    usersCache.forEach((u) => {
+      const li = document.createElement("li");
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.value = u.id; cb.dataset.pick = "ca";
+      if (set.has(u.id)) cb.checked = true;
+      label.append(cb, document.createTextNode(u.username));
+      li.append(label); ul.appendChild(li);
+    });
+  }
+
+  el("btn-ca-save").onclick = () => {
+    const cid = parseInt(el("ca-members").dataset.channel || el("ca-channel").value, 10);
+    if (!cid) { caMsg.textContent = "load a channel first"; caMsg.className = "msg"; return; }
+    const members = [...document.querySelectorAll('input[data-pick="ca"]:checked')]
+      .map((c) => parseInt(c.value, 10));
+    send({ type: "admin_set_channel_access", channel_id: cid, members: members });
+  };
+
   function revealChat() {
-    encScreen.classList.add("hidden");
     chatScreen.classList.remove("hidden");
     msgInput.disabled = false;
     sendBtn.disabled = false;
-    encReady = true;
+    attachBtn.disabled = false;
     msgInput.focus();
     if (currentChannelId === null && channels.length > 0) joinChannel(channels[0].id);
   }
-
-  let encLogin = null;
-  function startEncryptionGate(login) {
-    encLogin = login;
-    encMsg.textContent = "";
-    encPass.value = ""; encConfirm.value = "";
-    if (!TCE.supported()) {
-      // WebCrypto is unavailable (e.g. plain HTTP on a non-localhost origin).
-      setLock("off");
-      revealChat();
-      return;
-    }
-    if (login.has_keys) {
-      encSub.textContent = "This account has end-to-end encryption. Enter your"
-        + " passphrase to read and send encrypted messages.";
-      encConfirm.classList.add("hidden");
-      btnEncOk.textContent = "Unlock";
-      btnEncSkip.textContent = "Skip";
-    } else {
-      encSub.textContent = "Set up end-to-end encryption so your messages are"
-        + " readable only by channel members, not the server. This passphrase"
-        + " is NOT your login password and is never sent to the server, so it"
-        + " cannot be recovered if you forget it.";
-      encConfirm.classList.remove("hidden");
-      btnEncOk.textContent = "Enable";
-      btnEncSkip.textContent = "Skip";
-    }
-    encScreen.classList.remove("hidden");
-    encPass.focus();
-  }
-
-  btnEncSkip.onclick = () => {
-    identity = null;
-    setLock(encLogin && encLogin.has_keys ? "locked" : "off");
-    revealChat();
-  };
-
-  btnEncOk.onclick = async () => {
-    const pass = encPass.value;
-    if (!pass) { btnEncSkip.click(); return; }
-    btnEncOk.disabled = true; encMsg.textContent = "";
-    try {
-      if (encLogin.has_keys) {
-        identity = await TCE.unlock(encLogin.enc_private_key, encLogin.key_salt, pass);
-      } else {
-        if (pass !== encConfirm.value) {
-          encMsg.textContent = "passphrases do not match";
-          btnEncOk.disabled = false; return;
-        }
-        const id = await TCE.generateIdentity();
-        const wrapped = await TCE.wrapPrivateKey(id, pass);
-        const ack = await new Promise((resolve) => {
-          pendingKeysSet = resolve;
-          send({ type: "set_keys", public_key: id.publicB64,
-                 enc_private_key: wrapped.encPrivateB64, key_salt: wrapped.saltHex });
-        });
-        if (!ack || !ack.ok) {
-          encMsg.textContent = "could not save your key to the server";
-          btnEncOk.disabled = false; return;
-        }
-        identity = id;
-      }
-      setLock("on");
-      btnEncOk.disabled = false;
-      revealChat();
-    } catch (e) {
-      encMsg.textContent = encLogin.has_keys
-        ? "wrong passphrase, try again" : "encryption setup failed";
-      encPass.value = "";
-      btnEncOk.disabled = false;
-    }
-  };
-
-  encPass.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter") return;
-    if (encConfirm.classList.contains("hidden")) btnEncOk.click();
-    else encConfirm.focus();
-  });
-  encConfirm.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") btnEncOk.click();
-  });
 
   connect();
 })();

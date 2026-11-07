@@ -18,23 +18,25 @@ CREATE TABLE IF NOT EXISTS users (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     username        TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash   TEXT NOT NULL,
-    created_at      INTEGER NOT NULL,
-    -- End-to-end encryption identity (all nullable until the user sets it up).
-    -- public_key: base64 uncompressed ECDH P-256 point, handed out to peers.
-    -- enc_private_key: the user's PKCS8 private key, AES-GCM wrapped under a
-    --   passphrase the server never sees; stored only so a new device can
-    --   restore the identity. The server cannot decrypt it.
-    -- key_salt: PBKDF2 salt (hex) for that wrapping.
-    public_key      TEXT,
-    enc_private_key TEXT,
-    key_salt        TEXT
+    role            TEXT NOT NULL DEFAULT 'user',   -- 'admin' | 'user'
+    created_at      INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS channels (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- 0: visible to everyone. 1: visible only to users listed in
+    -- channel_access (plus admins, who can always see every channel).
+    is_private INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-user allowlist for private channels.
+CREATE TABLE IF NOT EXISTS channel_access (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (channel_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -113,11 +115,17 @@ class Database:
     def _migrate(self):
         """Add columns introduced after the original schema to pre-existing
         databases. Called with the lock held."""
-        cols = {r["name"] for r in
-                self._conn.execute("PRAGMA table_info(users)").fetchall()}
-        for col in ("public_key", "enc_private_key", "key_salt"):
-            if col not in cols:
-                self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+        user_cols = {r["name"] for r in
+                     self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "role" not in user_cols:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        chan_cols = {r["name"] for r in
+                     self._conn.execute("PRAGMA table_info(channels)").fetchall()}
+        if "is_private" not in chan_cols:
+            self._conn.execute(
+                "ALTER TABLE channels ADD COLUMN is_private "
+                "INTEGER NOT NULL DEFAULT 0")
 
     def close(self):
         with self._lock:
@@ -125,7 +133,7 @@ class Database:
 
     # -- users ---------------------------------------------------------------
 
-    def create_user(self, username: str, password: str):
+    def create_user(self, username: str, password: str, role: str = "user"):
         """Return ``(user_id, None)`` on success or ``(None, error)``."""
         username = username.strip()
         if not username:
@@ -134,13 +142,15 @@ class Database:
             return None, "Username must be 32 characters or fewer."
         if not password:
             return None, "Password cannot be empty."
+        if role not in ("admin", "user"):
+            return None, "Invalid role."
         now = int(time.time())
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO users (username, password_hash, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (username, hash_password(password), now),
+                    "INSERT INTO users (username, password_hash, role, "
+                    "created_at) VALUES (?, ?, ?, ?)",
+                    (username, hash_password(password), role, now),
                 )
                 self._conn.commit()
                 return cur.lastrowid, None
@@ -160,61 +170,141 @@ class Database:
             return None
         return row
 
-    # -- end-to-end encryption keys ------------------------------------------
-
-    def set_user_keys(self, user_id: int, public_key: str,
-                      enc_private_key: str, key_salt: str):
-        """Store (or replace) a user's encryption identity. Only ever handles
-        the public key and the already-wrapped private blob - never anything
-        the server could decrypt."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE users SET public_key = ?, enc_private_key = ?, "
-                "key_salt = ? WHERE id = ?",
-                (public_key, enc_private_key, key_salt, user_id),
-            )
-            self._conn.commit()
-
-    def get_user_keys(self, user_id: int):
-        """Return ``{public_key, enc_private_key, key_salt}`` for a user, with
-        ``None`` values if they haven't set up encryption."""
+    def get_user(self, user_id: int):
         with self._lock:
             row = self._conn.execute(
-                "SELECT public_key, enc_private_key, key_salt "
-                "FROM users WHERE id = ?", (user_id,)
+                "SELECT id, username, role, created_at FROM users WHERE id = ?",
+                (user_id,),
             ).fetchone()
         return dict(row) if row else None
 
-    def get_member_public_keys(self, channel_id: int):
-        """Public keys of every member of a channel that has an encryption
-        identity. Returned as ``[{user_id, username, public_key}, ...]`` -
-        the recipient set an encrypted message must be sealed to."""
+    def get_user_by_name(self, username: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, username, role, created_at FROM users "
+                "WHERE username = ?", (username.strip(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self):
+        """All users (no password hashes), for the admin panel."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT u.id AS user_id, u.username, u.public_key "
-                "FROM memberships m "
-                "JOIN users u ON u.id = m.user_id "
-                "WHERE m.channel_id = ? AND u.public_key IS NOT NULL "
-                "ORDER BY u.id",
-                (channel_id,),
+                "SELECT id, username, role, created_at FROM users "
+                "ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def set_password(self, user_id: int, password: str):
+        if not password:
+            return "Password cannot be empty."
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(password), user_id),
+            )
+            self._conn.commit()
+        return None
+
+    def delete_user(self, user_id: int):
+        with self._lock:
+            self._conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            self._conn.commit()
+
+    def count_admins(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE role = 'admin'"
+            ).fetchone()
+        return row["n"]
+
+    def ensure_admin(self, username: str, password: str):
+        """Create the admin account if it doesn't exist; if it exists, make
+        sure it has the admin role (and reset its password). Returns the
+        admin's user id."""
+        existing = self.get_user_by_name(username)
+        if existing is None:
+            uid, err = self.create_user(username, password, role="admin")
+            if err:
+                raise ValueError(f"could not create admin: {err}")
+            return uid
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET role = 'admin', password_hash = ? "
+                "WHERE id = ?", (hash_password(password), existing["id"]),
+            )
+            self._conn.commit()
+        return existing["id"]
+
+    # -- channel access (private-channel allowlist) -------------------------
+
+    def set_channel_access(self, channel_id: int, user_ids):
+        """Replace the allowlist for a private channel with ``user_ids``."""
+        ids = [(channel_id, int(u)) for u in user_ids]
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM channel_access WHERE channel_id = ?",
+                (channel_id,))
+            if ids:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO channel_access "
+                    "(channel_id, user_id) VALUES (?, ?)", ids)
+            self._conn.commit()
+
+    def get_channel_access(self, channel_id: int):
+        """List of user ids allowed into a private channel."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT user_id FROM channel_access WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchall()
+        return [r["user_id"] for r in rows]
+
+    def can_access_channel(self, user, channel_id: int) -> bool:
+        """``user`` is a row/dict with id+role. Admins see everything; public
+        channels are open to all; private channels require an allowlist entry."""
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            return False
+        if not channel["is_private"]:
+            return True
+        if user and user["role"] == "admin":
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM channel_access WHERE channel_id = ? "
+                "AND user_id = ?", (channel_id, user["id"]),
+            ).fetchone()
+        return row is not None
 
     # -- channels ------------------------------------------------------------
 
-    def list_channels(self):
+    def list_channels(self, user=None):
+        """Channels visible to ``user`` (a row/dict with id+role), each with a
+        member_count. ``None`` lists every channel (internal use)."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT c.id, c.name, c.created_by, c.created_at, "
-                "       COUNT(m.user_id) AS member_count "
+                "       c.is_private, COUNT(m.user_id) AS member_count "
                 "FROM channels c "
                 "LEFT JOIN memberships m ON m.channel_id = c.id "
-                "GROUP BY c.id "
-                "ORDER BY c.id"
+                "GROUP BY c.id ORDER BY c.id"
             ).fetchall()
-        return [dict(r) for r in rows]
+            allowed = None
+            if user is not None and user["role"] != "admin":
+                allowed = {r["channel_id"] for r in self._conn.execute(
+                    "SELECT channel_id FROM channel_access WHERE user_id = ?",
+                    (user["id"],)).fetchall()}
+        out = []
+        for r in rows:
+            d = dict(r)
+            if allowed is not None and d["is_private"] and d["id"] not in allowed:
+                continue
+            out.append(d)
+        return out
 
-    def create_channel(self, name: str, created_by: int):
+    def create_channel(self, name: str, created_by: int,
+                        is_private: bool = False):
         name = name.strip().lstrip("#").strip()
         if not name:
             return None, "Channel name cannot be empty."
@@ -224,9 +314,9 @@ class Database:
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO channels (name, created_by, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (name, created_by, now),
+                    "INSERT INTO channels (name, created_by, created_at, "
+                    "is_private) VALUES (?, ?, ?, ?)",
+                    (name, created_by, now, 1 if is_private else 0),
                 )
                 self._conn.commit()
                 return cur.lastrowid, None

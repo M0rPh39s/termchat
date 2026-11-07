@@ -4,6 +4,8 @@
 # onto a queue that the UI drains via after(). Login screen can also spin
 # up an embedded server ("host a local server").
 
+import base64
+import json
 import os
 import queue
 import socket
@@ -13,11 +15,29 @@ import time
 import tkinter as tk
 import zlib
 from datetime import datetime
+from tkinter import filedialog
 from tkinter import font as tkfont
 
 from . import DEFAULT_HOST, DEFAULT_PORT, __version__
-from . import crypto
 from .protocol import ProtocolError, recv_msg, send_msg
+
+# Marker prefixing a chat message whose content is a file attachment.
+FILE_PREFIX = "TCFILE1:"
+
+
+def _parse_file(content):
+    if not isinstance(content, str) or not content.startswith(FILE_PREFIX):
+        return None
+    try:
+        return json.loads(base64.b64decode(
+            content[len(FILE_PREFIX):]).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _make_file_content(info) -> str:
+    return FILE_PREFIX + base64.b64encode(
+        json.dumps(info).encode("utf-8")).decode("ascii")
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -91,8 +111,12 @@ class GuiNetwork:
         self._recv_thread = None
         self.connected = False
 
-    def connect(self, host: str, port: int):
+    def connect(self, host: str, port: int, use_tls: bool = False):
         self.sock = socket.create_connection((host, port), timeout=10)
+        if use_tls:
+            from . import tls
+            ctx = tls.client_context(insecure=True)
+            self.sock = ctx.wrap_socket(self.sock, server_hostname=host)
         self.sock.settimeout(None)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.connected = True
@@ -221,110 +245,6 @@ class NameDialog(tk.Toplevel):
         self.destroy()
 
 
-class EncryptionDialog(tk.Toplevel):
-    """Set up or unlock the user's end-to-end encryption identity.
-
-    On close, ``self.identity`` is a :class:`crypto.Identity` (or ``None``)
-    and ``self.mode`` is "on", "locked" or "off"."""
-
-    def __init__(self, parent, net, login):
-        super().__init__(parent)
-        self.net = net
-        self.login = login
-        self.identity = None
-        self.mode = "off"
-        self.has_keys = bool(login.get("has_keys"))
-
-        self.title("End-to-end encryption")
-        self.configure(bg=PANEL, padx=22, pady=18)
-        self.resizable(False, False)
-        self.transient(parent)
-
-        tk.Label(self, text="🔒  End-to-end encryption", bg=PANEL, fg=ACCENT,
-                 font=(FONT_FAMILY, 13, "bold")).pack(anchor="w")
-
-        if self.has_keys:
-            blurb = ("Enter your encryption passphrase to read and send\n"
-                     "encrypted messages. Leave blank to continue locked.")
-        else:
-            blurb = ("Pick an encryption passphrase so your messages are\n"
-                     "readable only by channel members, not the server.\n"
-                     "It is NOT your login password and is never sent to\n"
-                     "the server — it cannot be recovered if forgotten.\n"
-                     "Leave blank to skip and send in plaintext.")
-        tk.Label(self, text=blurb, bg=PANEL, fg=FG_DIM, justify="left",
-                 font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(4, 12))
-
-        self.pass_e = _entry(self, width=32, show="•")
-        self.pass_e.pack(fill="x", ipady=4)
-        self.confirm_e = None
-        if not self.has_keys:
-            tk.Label(self, text="confirm passphrase", bg=PANEL, fg=FG_DIM,
-                     font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(10, 1))
-            self.confirm_e = _entry(self, width=32, show="•")
-            self.confirm_e.pack(fill="x", ipady=4)
-
-        self.status = tk.Label(self, text="", bg=PANEL, fg=RED,
-                               font=(FONT_FAMILY, 9), wraplength=300,
-                               justify="left")
-        self.status.pack(anchor="w", pady=(10, 0))
-
-        row = tk.Frame(self, bg=PANEL)
-        row.pack(fill="x", pady=(12, 0))
-        _button(row, "Skip", self._skip).pack(side="right", padx=(8, 0))
-        _button(row, "Unlock" if self.has_keys else "Enable",
-                self._ok, primary=True).pack(side="right")
-
-        self.pass_e.bind("<Return>", lambda e: self._ok())
-        self.bind("<Escape>", lambda e: self._skip())
-        self.pass_e.focus_set()
-        self.grab_set()
-        self.update_idletasks()
-        px = parent.winfo_rootx() + parent.winfo_width() // 2
-        py = parent.winfo_rooty() + parent.winfo_height() // 2
-        self.geometry(f"+{px - self.winfo_width() // 2}"
-                      f"+{py - self.winfo_height() // 2}")
-        self.wait_window()
-
-    def _skip(self):
-        self.identity = None
-        self.mode = "locked" if self.has_keys else "off"
-        self.destroy()
-
-    def _ok(self):
-        passphrase = self.pass_e.get()
-        if not passphrase:
-            self._skip()
-            return
-        if self.has_keys:
-            try:
-                self.identity = crypto.Identity.unlock(
-                    self.login["enc_private_key"], self.login["key_salt"],
-                    passphrase)
-                self.mode = "on"
-                self.destroy()
-            except Exception:
-                self.status.configure(text="Wrong passphrase, try again.")
-                self.pass_e.delete(0, "end")
-            return
-        # First-time setup.
-        if passphrase != self.confirm_e.get():
-            self.status.configure(text="Passphrases do not match.")
-            return
-        ident = crypto.Identity.generate()
-        enc_private, salt = ident.wrap_private_key(passphrase)
-        reply = self.net.request(
-            {"type": "set_keys", "public_key": ident.public_b64,
-             "enc_private_key": enc_private, "key_salt": salt},
-            "keys_set_result")
-        if reply is None or not reply.get("ok"):
-            self.status.configure(text="Could not save your key to the server.")
-            return
-        self.identity = ident
-        self.mode = "on"
-        self.destroy()
-
-
 # ---------------------------------------------------------------------------
 # Login screen
 # ---------------------------------------------------------------------------
@@ -376,12 +296,20 @@ class LoginFrame(tk.Frame):
             font=(FONT_FAMILY, 9), highlightthickness=0)
         host_chk.pack(anchor="w", pady=(12, 0))
 
+        self.tls_var = tk.BooleanVar(value=False)
+        tls_chk = tk.Checkbutton(
+            card, text="Connect over TLS (encrypted)",
+            variable=self.tls_var, bg=PANEL, fg=FG, selectcolor=FIELD,
+            activebackground=PANEL, activeforeground=FG,
+            font=(FONT_FAMILY, 9), highlightthickness=0)
+        tls_chk.pack(anchor="w")
+
         btns = tk.Frame(card, bg=PANEL)
         btns.pack(fill="x", pady=(16, 0))
         self.login_b = _button(btns, "Log in", self._login, primary=True)
         self.login_b.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        self.reg_b = _button(btns, "Register", self._register)
-        self.reg_b.pack(side="left", expand=True, fill="x")
+        self.admin_b = _button(btns, "Admin (local)", self._admin)
+        self.admin_b.pack(side="left", expand=True, fill="x")
 
         self.status = tk.Label(card, text="", bg=PANEL, fg=RED,
                                font=(FONT_FAMILY, 9), wraplength=280,
@@ -400,9 +328,9 @@ class LoginFrame(tk.Frame):
     def _set_busy(self, busy: bool):
         state = "disabled" if busy else "normal"
         self.login_b.configure(state=state)
-        self.reg_b.configure(state=state)
+        self.admin_b.configure(state=state)
 
-    def _validate(self):
+    def _validate_hostport(self):
         host = self.host_e.get().strip() or DEFAULT_HOST
         try:
             port = int(self.port_e.get().strip() or DEFAULT_PORT)
@@ -410,6 +338,12 @@ class LoginFrame(tk.Frame):
                 raise ValueError
         except ValueError:
             self.set_status("Port must be a number between 1 and 65535.")
+            return None
+        return host, port
+
+    def _validate(self):
+        hp = self._validate_hostport()
+        if hp is None:
             return None
         username = self.user_e.get().strip()
         password = self.pass_e.get()
@@ -419,21 +353,29 @@ class LoginFrame(tk.Frame):
         if not password:
             self.set_status("Password cannot be empty.")
             return None
-        return host, port, username, password
+        return hp[0], hp[1], username, password
 
     def _login(self):
-        self._go(register_first=False)
-
-    def _register(self):
-        self._go(register_first=True)
-
-    def _go(self, register_first: bool):
         creds = self._validate()
         if creds is None:
             return
         host, port, username, password = creds
+        self._go(host, port, username, password, admin=False)
 
-        if self.host_var.get():
+    def _admin(self):
+        # Passwordless admin login; only works when connecting to a server on
+        # this same host (loopback). Username/password fields are ignored.
+        hp = self._validate_hostport()
+        if hp is None:
+            return
+        self._go(hp[0], hp[1], None, None, admin=True)
+
+    def _go(self, host, port, username, password, admin=False):
+        hosting = self.host_var.get()
+        # The embedded local server runs without TLS, so ignore the checkbox
+        # when hosting locally.
+        use_tls = self.tls_var.get() and not hosting
+        if hosting:
             err = self.app.ensure_local_server(port)
             if err:
                 self.set_status(err)
@@ -443,37 +385,28 @@ class LoginFrame(tk.Frame):
                 color=GREEN)
 
         self._set_busy(True)
-        if not self.host_var.get():
+        if not hosting:
             self.set_status("Connecting…", color=FG_DIM)
         threading.Thread(
             target=self._worker,
-            args=(host, port, username, password, register_first),
+            args=(host, port, username, password, admin, use_tls),
             daemon=True).start()
 
-    def _worker(self, host, port, username, password, register_first):
+    def _worker(self, host, port, username, password, admin, use_tls=False):
         """Connect + authenticate off the UI thread; report via after()."""
         net = GuiNetwork()
         try:
-            net.connect(host, port)
+            net.connect(host, port, use_tls=use_tls)
         except OSError as exc:
             self._done(net, error=f"Could not connect to {host}:{port} — {exc}")
             return
 
-        if register_first:
+        if admin:
+            reply = net.request({"type": "auto_login"}, "login_result")
+        else:
             reply = net.request(
-                {"type": "register", "username": username,
-                 "password": password}, "register_result")
-            if reply is None:
-                self._done(net, error="No response from server.")
-                return
-            if not reply.get("ok"):
-                self._done(net, error=reply.get("error")
-                           or reply.get("content") or "Registration failed.")
-                return
-
-        reply = net.request(
-            {"type": "login", "username": username, "password": password},
-            "login_result")
+                {"type": "login", "username": username, "password": password},
+                "login_result")
         if reply is None:
             self._done(net, error="No response from server.")
             return
@@ -505,14 +438,10 @@ class LoginFrame(tk.Frame):
 class ChatFrame(tk.Frame):
     SIDEBAR_W = 200
 
-    def __init__(self, app, username, identity=None, enc_mode="off"):
+    def __init__(self, app, username):
         super().__init__(app, bg=BG)
         self.app = app
         self.username = username
-
-        self.identity = identity        # crypto.Identity or None
-        self.enc_mode = enc_mode        # "on" | "locked" | "off"
-        self.member_keys = {}           # channel_id -> [public_key_b64, ...]
 
         self.channels = []              # channel dicts from the server
         self.active_channel_id = None
@@ -573,14 +502,6 @@ class ChatFrame(tk.Frame):
             font=(FONT_FAMILY, 12, "bold"))
         self.header_lbl.pack(side="left", padx=14)
 
-        _lock_txt = {"on": "🔒 e2e", "locked": "🔒 locked",
-                     "off": "🔓 plaintext"}.get(self.enc_mode, "")
-        _lock_fg = {"on": GREEN, "locked": YELLOW,
-                    "off": RED}.get(self.enc_mode, FG_DIM)
-        self.lock_lbl = tk.Label(header, text=_lock_txt, bg=PANEL_2,
-                                 fg=_lock_fg, font=(FONT_FAMILY, 10, "bold"))
-        self.lock_lbl.pack(side="right", padx=14)
-
         # Bottom rows are packed first (side="bottom") so the expanding
         # chat body can never squeeze them out of a small window.
         self.status = tk.Label(main, text="", bg=BG, fg=YELLOW, anchor="w",
@@ -589,6 +510,7 @@ class ChatFrame(tk.Frame):
 
         inrow = tk.Frame(main, bg=BG, pady=10)
         inrow.pack(side="bottom", fill="x", padx=12)
+        _button(inrow, "📎", self._attach).pack(side="left", padx=(0, 8))
         self.input_e = _entry(inrow)
         self.input_e.pack(side="left", fill="x", expand=True,
                           ipady=7, padx=(0, 8))
@@ -613,6 +535,8 @@ class ChatFrame(tk.Frame):
         self.text.tag_configure("sys", foreground=FG_DIM,
                                 font=(FONT_FAMILY, 10, "italic"))
         self.text.tag_configure("body", foreground=FG)
+        self.text.tag_configure("file", foreground=ACCENT,
+                                font=(FONT_FAMILY, 11, "bold"))
 
         self.input_e.focus_set()
 
@@ -645,31 +569,22 @@ class ChatFrame(tk.Frame):
                 self.set_status("")
                 self._render_channels()
                 self._render_messages()
-                self.app.net.send({"type": "get_member_keys",
-                                   "channel_id": msg["channel_id"]})
             else:
                 self.set_status(msg.get("error") or "could not join channel")
         elif mtype == "history":
             cid = msg["channel_id"]
-            self.messages[cid] = [self._decrypt(x)
-                                  for x in msg.get("messages", [])]
+            self.messages[cid] = list(msg.get("messages", []))
             if cid == self.active_channel_id:
                 self._render_messages()
         elif mtype == "message":
             cid = msg["channel_id"]
-            msg = self._decrypt(msg)
             self.messages.setdefault(cid, []).append(msg)
             if cid == self.active_channel_id:
                 self._append_message(msg)
-        elif mtype == "member_keys":
-            self.member_keys[msg["channel_id"]] = [
-                k["public_key"] for k in msg.get("keys", [])
-                if k.get("public_key")]
         elif mtype == "users":
             cid = msg["channel_id"]
             if cid == self.active_channel_id:
                 self._render_users(msg.get("users", []))
-            self.app.net.send({"type": "get_member_keys", "channel_id": cid})
         elif mtype == "presence":
             cid = msg["channel_id"]
             verb = "joined" if msg.get("status") == "online" else "left"
@@ -686,6 +601,16 @@ class ChatFrame(tk.Frame):
                 self._append_message(note)
             if cid is not None:
                 self.messages.setdefault(cid, []).append(note)
+        elif mtype == "upload_result":
+            if msg.get("ok"):
+                self.app.net.send({"type": "send_message",
+                                   "content": _make_file_content(
+                                       {"url": msg.get("url"),
+                                        "name": msg.get("name"),
+                                        "size": msg.get("size")})})
+                self.set_status(f"uploaded {msg.get('name')}")
+            else:
+                self.set_status(f"upload failed: {msg.get('error')}")
         elif mtype == "error":
             self.set_status(msg.get("content", "server error"))
 
@@ -693,20 +618,6 @@ class ChatFrame(tk.Frame):
 
     def set_status(self, text):
         self.status.configure(text=text)
-
-    def _decrypt(self, msg):
-        """Replace an encrypted message's content with plaintext (or a
-        placeholder we can't read). Pass other messages through untouched."""
-        content = msg.get("content", "")
-        if not crypto.is_encrypted(content):
-            return msg
-        if self.identity is None:
-            msg["content"] = "[encrypted - unlock to read]"
-        else:
-            plain = self.identity.decrypt(content)
-            msg["content"] = (plain if plain is not None
-                              else "[encrypted - not addressed to you]")
-        return msg
 
     def _render_channels(self):
         self.ch_list.delete(0, "end")
@@ -759,7 +670,12 @@ class ChatFrame(tk.Frame):
         author = msg.get("username", "?")
         self.text.insert("end", f"{ts}  ", "ts")
         self.text.insert("end", f"{author}  ", self._tag_for_user(author))
-        self.text.insert("end", msg.get("content", "") + "\n", "body")
+        finfo = _parse_file(msg.get("content", ""))
+        if finfo:
+            label = f"📎 {finfo.get('name', 'file')}  {finfo.get('url', '')}\n"
+            self.text.insert("end", label, "file")
+        else:
+            self.text.insert("end", msg.get("content", "") + "\n", "body")
 
     # -- actions ------------------------------------------------------------
 
@@ -788,21 +704,31 @@ class ChatFrame(tk.Frame):
         if self.active_channel_id is None:
             self.set_status("join a channel first")
             return
-        if self.identity is not None:
-            recipients = list(self.member_keys.get(self.active_channel_id, []))
-            if self.identity.public_b64 not in recipients:
-                recipients.append(self.identity.public_b64)
-            try:
-                content = crypto.encrypt(text, recipients)
-            except ValueError:
-                self.set_status("no encryption keys available yet")
-                return
-        else:
-            content = text
-        if self.app.net.send({"type": "send_message", "content": content}):
+        if self.app.net.send({"type": "send_message", "content": text}):
             self.input_e.delete(0, "end")
         else:
             self.set_status("not connected")
+
+    def _attach(self):
+        if self.active_channel_id is None:
+            self.set_status("join a channel first")
+            return
+        path = filedialog.askopenfilename(title="Choose a file to upload")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            self.set_status(f"can't read file: {exc}")
+            return
+        if len(data) > 10 * 1024 * 1024:
+            self.set_status("file too large (max 10 MB)")
+            return
+        self.set_status(f"uploading {os.path.basename(path)}...")
+        self.app.net.send({"type": "upload_file",
+                           "name": os.path.basename(path),
+                           "data": base64.b64encode(data).decode("ascii")})
 
     def _logout(self):
         self.app.logout()
@@ -850,10 +776,7 @@ class TermChatApp(tk.Tk):
 
     def on_logged_in(self, net: GuiNetwork, login: dict):
         self.net = net
-        # Set up / unlock encryption before the async receiver starts, so the
-        # dialog can use synchronous request/response for set_keys.
-        dlg = EncryptionDialog(self, net, login)
-        chat = ChatFrame(self, login["username"], dlg.identity, dlg.mode)
+        chat = ChatFrame(self, login["username"])
         self._swap(chat)
         net.start_receiver()
         net.send({"type": "list_channels"})
