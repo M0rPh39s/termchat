@@ -155,6 +155,8 @@ class Server:
             "send_message": self._on_send_message,
             "get_history": self._on_get_history,
             "list_users": self._on_list_users,
+            "set_keys": self._on_set_keys,
+            "get_member_keys": self._on_get_member_keys,
             "logout": self._on_logout,
         }.get(mtype)
 
@@ -206,8 +208,16 @@ class Server:
 
         state.user_id = row["id"]
         state.username = row["username"]
+        # Hand back the user's encryption identity so the client can unlock it
+        # (or learn it needs to be set up). The private blob is already
+        # wrapped under the user's passphrase; the server never sees that.
+        keys = self.db.get_user_keys(row["id"]) or {}
         state.send({"type": "login_result", "ok": True,
                     "user_id": row["id"], "username": row["username"],
+                    "public_key": keys.get("public_key"),
+                    "enc_private_key": keys.get("enc_private_key"),
+                    "key_salt": keys.get("key_salt"),
+                    "has_keys": bool(keys.get("public_key")),
                     "error": None})
         log.info("%s logged in (%s)", state.username, state.addr)
         self._send_channels(state)
@@ -278,7 +288,16 @@ class Server:
         content = str(msg.get("content", "")).rstrip("\n")
         if not content:
             return
-        if len(content) > 4000:
+        # Encrypted envelopes carry a per-recipient wrapped key each, so they
+        # grow with channel size; give them a much larger ceiling than plain
+        # text and never truncate (that would corrupt the ciphertext).
+        from .crypto import is_encrypted
+        if is_encrypted(content):
+            if len(content) > 1_000_000:
+                state.send({"type": "error",
+                            "content": "encrypted message too large"})
+                return
+        elif len(content) > 4000:
             content = content[:4000]
         ts = self.db.add_message(state.channel_id, state.user_id, content)
         out = {"type": "message", "channel_id": state.channel_id,
@@ -302,6 +321,28 @@ class Server:
             return
         state.send({"type": "users", "channel_id": channel_id,
                     "users": self._online_users(channel_id)})
+
+    def _on_set_keys(self, state, msg):
+        public_key = msg.get("public_key")
+        enc_private_key = msg.get("enc_private_key")
+        key_salt = msg.get("key_salt")
+        if not (public_key and enc_private_key and key_salt):
+            state.send({"type": "keys_set_result", "ok": False,
+                        "error": "missing key material"})
+            return
+        self.db.set_user_keys(state.user_id, str(public_key),
+                              str(enc_private_key), str(key_salt))
+        state.send({"type": "keys_set_result", "ok": True, "error": None})
+        log.info("%s set an encryption key", state.username)
+
+    def _on_get_member_keys(self, state, msg):
+        try:
+            channel_id = int(msg.get("channel_id"))
+        except (TypeError, ValueError):
+            state.send({"type": "error", "content": "invalid channel id"})
+            return
+        state.send({"type": "member_keys", "channel_id": channel_id,
+                    "keys": self.db.get_member_public_keys(channel_id)})
 
     # -- helpers -------------------------------------------------------------
 

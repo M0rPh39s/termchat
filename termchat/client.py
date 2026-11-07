@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import DEFAULT_HOST, DEFAULT_PORT
+from . import crypto
 from .protocol import ProtocolError, recv_msg, send_msg
 
 # Colours cycled through to give each speaker a stable, distinct colour.
@@ -51,6 +52,10 @@ class ClientModel:
         self.input_buffer = ""
         self.status_line = ""
         self.running = True
+        # End-to-end encryption.
+        self.identity = None            # crypto.Identity once unlocked
+        self.enc_mode = "off"           # "off" | "on" | "locked"
+        self.member_keys = {}           # channel_id -> [public_key_b64, ...]
 
     def selected_channel(self):
         with self.lock:
@@ -131,6 +136,22 @@ class NetworkClient:
                     self.model.status_line = "! disconnected from server"
                 self.model.running = False
 
+    def _decrypt_msg(self, msg: dict) -> dict:
+        """Replace an encrypted message's content with its plaintext (or a
+        placeholder when we can't read it). System messages pass through."""
+        content = msg.get("content", "")
+        if not crypto.is_encrypted(content):
+            return msg
+        ident = self.model.identity
+        if ident is None:
+            msg["content"] = "[encrypted - unlock to read]"
+        else:
+            plain = ident.decrypt(content)
+            msg["content"] = (plain if plain is not None
+                              else "[encrypted - not addressed to you]")
+        msg["encrypted"] = True
+        return msg
+
     def _handle(self, msg: dict):
         mtype = msg.get("type")
         m = self.model
@@ -151,21 +172,34 @@ class NetworkClient:
                     m.active_channel_id = msg["channel_id"]
                     m.active_channel_name = msg["name"]
                     m.status_line = f"joined #{msg['name']}"
+                # Learn who we can encrypt to in this channel.
+                self.send({"type": "get_member_keys",
+                           "channel_id": msg["channel_id"]})
             else:
                 with m.lock:
                     m.status_line = f"! {msg.get('error')}"
         elif mtype == "history":
             cid = msg["channel_id"]
+            msgs = [self._decrypt_msg(x) for x in msg.get("messages", [])]
             with m.lock:
-                m.messages[cid] = list(msg.get("messages", []))
+                m.messages[cid] = msgs
         elif mtype == "message":
             cid = msg["channel_id"]
+            msg = self._decrypt_msg(msg)
             with m.lock:
                 m.messages.setdefault(cid, []).append(msg)
+        elif mtype == "member_keys":
+            cid = msg["channel_id"]
+            with m.lock:
+                m.member_keys[cid] = [
+                    k["public_key"] for k in msg.get("keys", [])
+                    if k.get("public_key")]
         elif mtype == "users":
             cid = msg["channel_id"]
             with m.lock:
                 m.online[cid] = msg.get("users", [])
+            # Membership may have changed; refresh the recipient set.
+            self.send({"type": "get_member_keys", "channel_id": cid})
         elif mtype == "presence":
             cid = msg["channel_id"]
             verb = "joined" if msg.get("status") == "online" else "left"
@@ -188,8 +222,9 @@ class NetworkClient:
 # Login / registration screen (plain rich prompts, no raw mode yet)
 # ---------------------------------------------------------------------------
 
-def login_screen(net: NetworkClient, console: Console) -> str:
-    """Run the login/registration flow.  Returns the logged-in username."""
+def login_screen(net: NetworkClient, console: Console) -> dict:
+    """Run the login/registration flow.  Returns the ``login_result`` reply
+    (which carries the username and the user's encryption key material)."""
     console.clear()
     console.print(Panel(
         Align.center(Text("termchat", style="bold cyan")
@@ -232,7 +267,71 @@ def login_screen(net: NetworkClient, console: Console) -> str:
         if not reply.get("ok"):
             console.print(f"[red]{reply.get('error') or reply.get('content')}[/red]")
             continue
-        return reply["username"]
+        return reply
+
+
+def encryption_screen(net: NetworkClient, console: Console, login: dict):
+    """Set up or unlock the user's end-to-end encryption identity.
+
+    Returns ``(identity_or_None, mode)`` where mode is "on", "locked" or
+    "off".  A blank passphrase skips encryption for the session."""
+    console.print()
+    if login.get("has_keys"):
+        console.print(Panel(
+            Text("This account has end-to-end encryption set up.\n"
+                 "Enter your encryption passphrase to read and send "
+                 "encrypted messages.", style="cyan"),
+            border_style="cyan", title="🔒 encryption"))
+        for _ in range(3):
+            passphrase = Prompt.ask(
+                "encryption passphrase [dim](blank to skip)[/dim]",
+                password=True, default="", show_default=False)
+            if not passphrase:
+                console.print("[yellow]skipping — encrypted messages will "
+                              "show as locked[/yellow]")
+                return None, "locked"
+            try:
+                ident = crypto.Identity.unlock(
+                    login["enc_private_key"], login["key_salt"], passphrase)
+                console.print("[green]unlocked — end-to-end encryption on[/green]")
+                return ident, "on"
+            except Exception:
+                console.print("[red]wrong passphrase, try again[/red]")
+        console.print("[yellow]continuing locked[/yellow]")
+        return None, "locked"
+
+    # No identity yet: offer to create one.
+    console.print(Panel(
+        Text("Set up end-to-end encryption so your messages are readable "
+             "only by channel members — not the server.\n"
+             "Pick an encryption passphrase. It is NOT your login password "
+             "and is never sent to the server, so it cannot be recovered if "
+             "you forget it.", style="cyan"),
+        border_style="cyan", title="🔒 encryption"))
+    while True:
+        passphrase = Prompt.ask(
+            "new encryption passphrase [dim](blank to skip)[/dim]",
+            password=True, default="", show_default=False)
+        if not passphrase:
+            console.print("[yellow]skipping — messages will be sent in "
+                          "plaintext[/yellow]")
+            return None, "off"
+        confirm = Prompt.ask("confirm passphrase", password=True,
+                             default="", show_default=False)
+        if passphrase != confirm:
+            console.print("[red]passphrases do not match[/red]")
+            continue
+        ident = crypto.Identity.generate()
+        enc_private, salt = ident.wrap_private_key(passphrase)
+        reply = net.request(
+            {"type": "set_keys", "public_key": ident.public_b64,
+             "enc_private_key": enc_private, "key_salt": salt},
+            "keys_set_result")
+        if reply is None or not reply.get("ok"):
+            console.print("[red]could not save your key to the server[/red]")
+            return None, "off"
+        console.print("[green]encryption set up — end-to-end encryption on[/green]")
+        return ident, "on"
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +418,19 @@ class ChatTUI:
         with m.lock:
             buf = m.input_buffer
             status = m.status_line
+            mode = m.enc_mode
         prompt = Text("> ", style="bold cyan")
         prompt.append(buf)
         prompt.append("_", style="blink")
         if status:
             prompt.append("    ")
             prompt.append(status, style="yellow")
-        return Panel(prompt, border_style="blue")
+        lock = {"on": ("🔒 e2e", "green"),
+                "locked": ("🔒 locked", "yellow"),
+                "off": ("🔓 plain", "red")}.get(mode, ("", "dim"))
+        title = Text(lock[0], style=lock[1])
+        return Panel(prompt, border_style="blue", title=title,
+                     title_align="right")
 
     def _render(self) -> Layout:
         layout = Layout()
@@ -366,6 +471,27 @@ class ChatTUI:
                 with m.lock:
                     m.status_line = "! join a channel first (Ctrl-N)"
                 return
+            self._send_chat(text)
+
+    def _send_chat(self, text: str):
+        """Encrypt (if unlocked) and send a chat line to the active channel."""
+        m = self.model
+        with m.lock:
+            ident = m.identity
+            cid = m.active_channel_id
+            recipients = list(m.member_keys.get(cid, []))
+        if ident is not None:
+            # Always include ourselves so our own messages stay readable.
+            if ident.public_b64 not in recipients:
+                recipients.append(ident.public_b64)
+            try:
+                payload = crypto.encrypt(text, recipients)
+            except ValueError:
+                with m.lock:
+                    m.status_line = "! no encryption keys available yet"
+                return
+            self.net.send({"type": "send_message", "content": payload})
+        else:
             self.net.send({"type": "send_message", "content": text})
 
     def _command(self, text: str):
@@ -530,13 +656,17 @@ def main(argv=None):
         return 1
 
     try:
-        username = login_screen(net, console)
+        login = login_screen(net, console)
+        identity, enc_mode = encryption_screen(net, console, login)
     except (KeyboardInterrupt, EOFError):
         console.print("\nbye!")
         return 0
 
     with model.lock:
-        model.username = username
+        model.username = login["username"]
+        model.identity = identity
+        model.enc_mode = enc_mode
+    username = login["username"]
 
     # Switch to async mode and enter the first channel automatically.
     net.start_receiver()
