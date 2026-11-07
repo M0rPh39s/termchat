@@ -20,6 +20,8 @@ server and share the same channels in real time.
 ## Features
 
 - accounts (passwords are PBKDF2-HMAC-SHA256 + salt, never stored plaintext)
+- **end-to-end encryption** (per-user keypairs; the server only ever sees
+  ciphertext — see [Encryption](#end-to-end-encryption) below)
 - channels, create your own, ships with #general/#random/#help
 - real-time messages + presence (who's online in a channel, live)
 - last 50 messages load automatically when you join a channel, everything's in SQLite
@@ -35,6 +37,7 @@ clients (TUI / GUI / browser)  <-- TCP, length-prefixed JSON -->  server (thread
 | file | what it does |
 |------|----|
 | `termchat/protocol.py` | length-prefixed JSON framing |
+| `termchat/crypto.py` | end-to-end encryption (keypairs, message sealing) |
 | `termchat/database.py` | schema, password hashing, queries |
 | `termchat/server.py` | TCP server, auth, routing, broadcast |
 | `termchat/client.py` | the TUI client |
@@ -47,11 +50,58 @@ clients run their UI on the main thread and read the socket on a
 background thread.
 
 Tables: `users`, `channels`, `messages`, `memberships` (who joined what).
+Each user row also carries their public key and a wrapped copy of their
+private key (see below); the `messages.content` column holds ciphertext for
+encrypted messages.
+
+## End-to-end encryption
+
+Messages can be end-to-end encrypted so that only channel members — never
+the server or anyone with the database file — can read them.
+
+**How it works**
+
+- Every user has an **ECDH P-256 keypair**. The private key is stored as a
+  PKCS8 blob wrapped with AES-256-GCM under a key derived (PBKDF2-SHA256,
+  200k iterations) from an **encryption passphrase**. That passphrase is
+  *separate from your login password* and is **never sent to the server**,
+  so the server cannot unwrap your private key. The wrapped blob and your
+  public key are stored server-side only so you can restore your identity on
+  another device.
+- Each message uses hybrid encryption: a random 256-bit content key seals the
+  text with AES-256-GCM, and that content key is ECIES-wrapped (ephemeral
+  ECDH → HKDF-SHA256 → AES-GCM) to every channel member's public key. The
+  server stores and relays only the resulting `TCE1:…` ciphertext envelope.
+- All three clients implement the exact same scheme — the Python clients via
+  `cryptography`, the browser via the built-in WebCrypto API — so they
+  interoperate byte for byte.
+
+**Using it**
+
+On login each client offers to set up encryption (first time) or unlock it
+(after that) with your encryption passphrase. Skip it and you fall back to
+plaintext; unlock it and messages are encrypted automatically. A lock
+indicator shows the current state (🔒 e2e / 🔒 locked / 🔓 plaintext).
+
+**Limitations, by design**
+
+- A message is encrypted to whoever is a member *at send time*, so someone
+  who joins a channel later cannot read older history. (New messages include
+  them once their key is known.)
+- Metadata is **not** encrypted: usernames, channel names, who's online, and
+  message timestamps still travel and are stored in the clear. Use TLS/a
+  tunnel (below) if that matters.
+- The encryption passphrase cannot be recovered. Forget it and the encrypted
+  messages addressed to you are unreadable — there is no backdoor.
+- Users who never set up a key can't be sent readable messages; their client
+  shows encrypted messages as locked placeholders.
 
 ## Setup
 
-Needs Python 3.8+. `rich` is the only third-party dependency and it's
-only used by the TUI client - everything else is stdlib.
+Needs Python 3.8+. Two third-party dependencies: `rich` (TUI client only)
+and `cryptography` (end-to-end encryption, used by the server and the Python
+clients). Everything else is stdlib. The browser client needs neither — it
+uses the built-in WebCrypto API.
 
 ```bash
 git clone https://github.com/M0rPh39s/termchat.git
@@ -116,7 +166,8 @@ channels, same people, as a fourth transport into the same server.
 python run_gui.py
 ```
 
-Stdlib only (Tkinter), runs on Windows/macOS/Linux. Tick "host a local
+Tkinter UI (stdlib) plus `cryptography` for encryption; PyInstaller bundles
+both into the exe. Runs on Windows/macOS/Linux. Tick "host a local
 server" on the login screen and it'll spin up an embedded server on the
 spot - handy for just handing a friend an .exe and a port number. The
 embedded server's db lives in `%LOCALAPPDATA%\TermChat\` (or `~/TermChat`
@@ -157,10 +208,12 @@ WantedBy=multi-user.target
 `sudo systemctl enable --now termchat`, then clients connect with
 `--host your.server.ip`.
 
-Heads up: traffic is plaintext JSON over TCP (passwords are hashed at
-rest, but the wire isn't encrypted). If this is going over the open
-internet, tunnel it - SSH port forward, VPN, whatever. Haven't gotten
-around to TLS.
+Heads up: message bodies are end-to-end encrypted once you unlock
+encryption, but the transport itself is still plaintext JSON over TCP, and
+metadata (usernames, channel names, presence, timestamps) travels in the
+clear. Passwords are hashed at rest. If metadata privacy matters or you're
+going over the open internet, tunnel it - SSH port forward, VPN, whatever.
+Haven't gotten around to TLS.
 
 ## Layout
 
@@ -168,6 +221,7 @@ around to TLS.
 termchat/
 ├── termchat/
 │   ├── protocol.py   # framing + message schema
+│   ├── crypto.py     # end-to-end encryption
 │   ├── database.py   # sqlite + password hashing
 │   ├── server.py     # TCP server
 │   ├── client.py     # TUI client

@@ -2,3 +2,7 @@
 # Everything else (socket, sqlite3, hashlib, threading, curses/termios) is
 # part of the Python standard library.
 rich>=13.0
+# End-to-end encryption (ECDH P-256, AES-GCM, HKDF). The browser client uses
+# the platform's built-in WebCrypto instead, so this is only needed by the
+# server and the Python (TUI/GUI) clients.
+cryptography>=41.0

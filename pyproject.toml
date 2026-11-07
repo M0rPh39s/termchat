@@ -9,7 +9,7 @@ description = "A TeamSpeak-style terminal chat application (server + TUI client)
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-dependencies = ["rich>=13.0"]
+dependencies = ["rich>=13.0", "cryptography>=41.0"]
 
 [project.scripts]
 termchat-server = "termchat.server:main"
