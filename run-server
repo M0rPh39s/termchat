@@ -6,7 +6,12 @@
 #   run-server              local venv (python .venv)
 #   run-server --docker     build + run the Docker container (docker compose)
 #
-# Usage: run-server [--docker] [--no-ngrok]
+# Usage: run-server [--docker] [--no-ngrok] [--tls] [--keep-data]
+#
+#   --tls         encrypt all connections with TLS (self-signed cert); the
+#                 ngrok tunnel then forwards to the https backend.
+#   --keep-data   keep the database + uploads across restarts (by default the
+#                 server is EPHEMERAL: everything is wiped on shutdown).
 #
 # Env overrides: TERMCHAT_HOST, TERMCHAT_PORT, TERMCHAT_WEB_PORT, TERMCHAT_DB
 set -uo pipefail
@@ -17,20 +22,31 @@ HOST="${TERMCHAT_HOST:-0.0.0.0}"
 PORT="${TERMCHAT_PORT:-9009}"
 WEB_PORT="${TERMCHAT_WEB_PORT:-8080}"
 DB="${TERMCHAT_DB:-$PROJECT_DIR/termchat.db}"
-NGROK_LOG="/tmp/termchat-ngrok.log"
+# Per-user log path: /tmp is sticky, so a file created by one user (e.g. root
+# via sudo) can't be truncated/overwritten by another (morpheus) - which would
+# break ngrok's output redirect and leave the tunnel offline. Keying on the
+# effective UID keeps sudo and non-sudo runs from colliding.
+NGROK_LOG="/tmp/termchat-ngrok-$(id -u).log"
 
 USE_NGROK=1
 USE_DOCKER=0
+USE_TLS=0
+EPHEMERAL=1          # wipe db + uploads on shutdown unless --keep-data
 for arg in "$@"; do
     case "$arg" in
-        --no-ngrok) USE_NGROK=0 ;;
-        --docker)   USE_DOCKER=1 ;;
+        --no-ngrok)  USE_NGROK=0 ;;
+        --docker)    USE_DOCKER=1 ;;
+        --tls)       USE_TLS=1 ;;
+        --keep-data) EPHEMERAL=0 ;;
         -h|--help)
             awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
             exit 0 ;;
         *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
     esac
 done
+
+# http/https for the printed URLs and the ngrok backend scheme.
+SCHEME="http"; [[ "$USE_TLS" -eq 1 ]] && SCHEME="https"
 
 SERVER_PID=""
 NGROK_PID=""
@@ -60,8 +76,10 @@ start_server_docker() {
     fi
     echo "building + starting termchat container (tcp:$PORT, web:$WEB_PORT)..."
     # TERMCHAT_PORT / TERMCHAT_WEB_PORT feed the host-side port mapping in
-    # docker-compose.yml; the database persists on the termchat-data volume.
+    # docker-compose.yml; TERMCHAT_TLS / TERMCHAT_EPHEMERAL toggle those
+    # features inside the container (the server reads them from the env).
     (cd "$PROJECT_DIR" && TERMCHAT_PORT="$PORT" TERMCHAT_WEB_PORT="$WEB_PORT" \
+        TERMCHAT_TLS="$USE_TLS" TERMCHAT_EPHEMERAL="$EPHEMERAL" \
         $COMPOSE up -d --build) || { echo "docker compose failed" >&2; exit 1; }
 }
 
@@ -72,8 +90,12 @@ start_server_venv() {
         exit 1
     fi
     echo "starting termchat server (tcp:$PORT, web:$WEB_PORT, db:$DB)..."
+    local extra=()
+    [[ "$USE_TLS" -eq 1 ]] && extra+=(--tls)
+    [[ "$EPHEMERAL" -eq 1 ]] && extra+=(--ephemeral)
     "$VENV_PY" "$PROJECT_DIR/run_server.py" \
-        --host "$HOST" --port "$PORT" --web-port "$WEB_PORT" --db "$DB" -v &
+        --host "$HOST" --port "$PORT" --web-port "$WEB_PORT" --db "$DB" \
+        "${extra[@]}" -v &
     SERVER_PID=$!
 }
 
@@ -94,14 +116,43 @@ done
 
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo
-echo "  local:  http://127.0.0.1:$WEB_PORT"
-[[ -n "$LAN_IP" ]] && echo "  lan:    http://$LAN_IP:$WEB_PORT"
+echo "  local:  $SCHEME://127.0.0.1:$WEB_PORT"
+[[ -n "$LAN_IP" ]] && echo "  lan:    $SCHEME://$LAN_IP:$WEB_PORT"
+[[ "$USE_TLS" -eq 1 ]] && echo "  (TLS uses a self-signed cert - browsers will warn once; click through)"
+[[ "$EPHEMERAL" -eq 1 ]] && echo "  (ephemeral: all data is wiped when this server stops)"
 
 if [[ "$USE_NGROK" -eq 1 ]]; then
+    # Resolve ngrok even when it isn't on PATH (e.g. launched via sudo, which
+    # strips ~/.local/bin, or from a non-login shell). Fall back to the usual
+    # install locations before giving up.
+    # When launched via sudo, resolve ngrok (and its authtoken config) from the
+    # invoking user's home, since sudo strips ~/.local/bin from PATH and root
+    # has no ngrok config of its own.
+    NGROK_HOME="$HOME"
+    [[ -n "${SUDO_USER:-}" ]] && NGROK_HOME="$(eval echo "~$SUDO_USER")"
+
+    NGROK_BIN=""
     if command -v ngrok >/dev/null 2>&1; then
-        echo "starting ngrok tunnel..."
-        : > "$NGROK_LOG"
-        ngrok http "$WEB_PORT" --log=stdout > "$NGROK_LOG" 2>&1 &
+        NGROK_BIN="$(command -v ngrok)"
+    else
+        for cand in "$NGROK_HOME/.local/bin/ngrok" "$HOME/.local/bin/ngrok" \
+                    /usr/local/bin/ngrok /snap/bin/ngrok /usr/bin/ngrok; do
+            [[ -x "$cand" ]] && { NGROK_BIN="$cand"; break; }
+        done
+    fi
+    if [[ -n "$NGROK_BIN" ]]; then
+        echo "starting ngrok tunnel ($NGROK_BIN)..."
+        # If the log path exists but isn't writable (e.g. left behind by a run
+        # as another user), fall back to a fresh temp file instead of failing.
+        if ! (: > "$NGROK_LOG") 2>/dev/null; then
+            NGROK_LOG="$(mktemp -t termchat-ngrok.XXXXXX.log)"
+        fi
+        # With TLS the local web server speaks https, so point ngrok at the
+        # https backend; otherwise the plain port number (http backend).
+        NGROK_TARGET="$WEB_PORT"
+        [[ "$USE_TLS" -eq 1 ]] && NGROK_TARGET="https://localhost:$WEB_PORT"
+        # HOME override lets ngrok read ~user/.config/ngrok/ngrok.yml under sudo.
+        HOME="$NGROK_HOME" "$NGROK_BIN" http "$NGROK_TARGET" --log=stdout > "$NGROK_LOG" 2>&1 &
         NGROK_PID=$!
         URL=""
         for _ in $(seq 1 40); do
