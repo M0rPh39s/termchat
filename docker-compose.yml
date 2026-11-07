@@ -11,8 +11,10 @@ services:
     container_name: termchat
     restart: unless-stopped
     ports:
-      - "9009:9009"   # TCP clients (TUI / GUI)
-      - "8080:8080"   # browser client (http://localhost:8080)
+      # host:container - the container always listens on 9009/8080 internally;
+      # override the host side with TERMCHAT_PORT / TERMCHAT_WEB_PORT.
+      - "${TERMCHAT_PORT:-9009}:9009"   # TCP clients (TUI / GUI)
+      - "${TERMCHAT_WEB_PORT:-8080}:8080"   # browser client
     volumes:
       - termchat-data:/data
 

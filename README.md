@@ -181,6 +181,19 @@ docker run -d --name termchat -p 9009:9009 -p 8080:8080 \
 Override the command to change ports or drop the web client, e.g.
 `docker run ... termchat python run_server.py --host 0.0.0.0 --port 9009 --db /data/termchat.db`.
 
+The `run-server` script can drive this for you, including the ngrok tunnel:
+
+```bash
+./run-server --docker            # build + start the container, host everything
+./run-server --docker --no-ngrok # ...without the public tunnel
+```
+
+`--docker` brings the stack up with `docker compose up -d --build`, waits for
+the web port, prints the local/LAN/public URLs, and tears the container back
+down (`docker compose down`) on Ctrl+C. `TERMCHAT_PORT` / `TERMCHAT_WEB_PORT`
+set the published host ports. Without `--docker` it runs from the local venv
+instead.
+
 Heads up: traffic is plaintext JSON over TCP (passwords are hashed at
 rest, but the wire isn't encrypted). If this is going over the open
 internet, tunnel it - SSH port forward, VPN, whatever. Haven't gotten
